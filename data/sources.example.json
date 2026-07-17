@@ -1,0 +1,11 @@
+{
+  "default_interval_seconds": 300,
+  "sources": [
+    {
+      "name": "example-sub",
+      "url": "https://example.com/sub",
+      "enabled": false,
+      "interval_seconds": 600
+    }
+  ]
+}

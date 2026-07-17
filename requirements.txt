@@ -1,0 +1,5 @@
+filelock>=3.12
+PyYAML>=6.0
+# P3 optional acceleration (stdlib fallbacks always work)
+orjson>=3.9; platform_python_implementation=="CPython"
+aiohttp>=3.9

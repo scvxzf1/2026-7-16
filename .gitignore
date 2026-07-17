@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.local/
+*.log
+*.db
+data/source_fetch_state.json
+data/proxies.txt
+data/stats*
+.pytest_cache/
+.mypy_cache/
+.DS_Store

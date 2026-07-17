@@ -1,0 +1,1344 @@
+# -*- coding: utf-8 -*-
+"""Fetch and parse proxy subscription links into local proxy pool lines.
+
+Supports:
+  - base64 / plain text subscription bodies
+  - Clash YAML (`proxies:` list) including type=http/socks5/vless/hysteria2/anytls/trojan/...
+  - http(s)://user:pass@host:port
+  - socks5://user:pass@host:port
+  - host:port:user:pass
+  - ss:// / vless:// / vmess:// / trojan:// / hy2:// / hysteria2:// / anytls://
+    (non-HTTP schemes are inventory / embedded-mihomo candidates; only HTTP
+    becomes usable pool entries for this project's curl-based registration flow)
+"""
+
+from __future__ import annotations
+
+import base64
+import json
+import os
+import re
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
+from urllib.parse import parse_qs, quote, unquote, urlencode, urlparse
+from urllib.request import Request, build_opener, urlopen
+
+try:
+    import yaml  # type: ignore
+except Exception:  # pragma: no cover
+    yaml = None
+
+# Shared opener (connection reuse where the stdlib allows).
+_OPENER_LOCK = threading.Lock()
+_OPENER = build_opener()
+_DEFAULT_FETCH_INTERVAL = 300.0
+_FETCH_STATE_ENV = "PROXY_SUB_FETCH_STATE"
+
+
+@dataclass
+class ParsedNode:
+    raw: str
+    scheme: str
+    host: str = ""
+    port: int = 0
+    username: str = ""
+    password: str = ""
+    name: str = ""
+    usable_http: bool = False
+    pool_line: str = ""
+    note: str = ""
+
+
+@dataclass
+class SubscriptionImportResult:
+    url: str
+    total_lines: int = 0
+    nodes: List[ParsedNode] = field(default_factory=list)
+    pool_lines: List[str] = field(default_factory=list)
+    usable_pool_lines: List[str] = field(default_factory=list)
+    skipped: List[str] = field(default_factory=list)
+    warnings: List[str] = field(default_factory=list)
+    body_kind: str = ""  # base64 / plain / clash-yaml
+    urls: List[str] = field(default_factory=list)
+    per_url: List[Dict[str, object]] = field(default_factory=list)
+
+    def to_dict(self) -> Dict[str, object]:
+        scheme_counts: Dict[str, int] = {}
+        for node in self.nodes:
+            scheme_counts[node.scheme] = scheme_counts.get(node.scheme, 0) + 1
+        urls = list(self.urls) if self.urls else ([self.url] if self.url else [])
+        return {
+            "url": self.url or (urls[0] if urls else ""),
+            "urls": urls,
+            "body_kind": self.body_kind,
+            "total_lines": self.total_lines,
+            "node_count": len(self.nodes),
+            "usable_http_count": sum(1 for n in self.nodes if n.usable_http),
+            "skipped_count": len(self.skipped),
+            "scheme_counts": scheme_counts,
+            "pool_lines": list(self.pool_lines),
+            "usable_pool_lines": list(self.usable_pool_lines),
+            "warnings": list(self.warnings),
+            "per_url": list(self.per_url),
+            "sample_nodes": [
+                {
+                    "scheme": n.scheme,
+                    "host": n.host,
+                    "port": n.port,
+                    "name": n.name,
+                    "usable_http": n.usable_http,
+                    "pool_line": n.pool_line,
+                    "note": n.note,
+                }
+                for n in self.nodes[:12]
+            ],
+        }
+
+
+def normalize_subscription_urls(
+    value: Union[None, str, Sequence[object]] = None,
+    *extra: object,
+) -> List[str]:
+    """Normalize subscription URL input into a de-duplicated ordered list.
+
+    Accepts a single string (multi-line or comma/semicolon separated), a sequence
+    of strings, and optional extra args. Empty entries are dropped. Relative
+    paths without http(s):// are kept only if they already look like URLs; caller
+    may further validate.
+    """
+    chunks: List[str] = []
+
+    def _push(item: object) -> None:
+        if item is None:
+            return
+        if isinstance(item, (list, tuple, set)):
+            for sub in item:
+                _push(sub)
+            return
+        text = str(item or "").replace("\r\n", "\n").replace("\r", "\n")
+        if not text.strip():
+            return
+        # Prefer line splits; also allow comma/semicolon on a single line.
+        for part in text.split("\n"):
+            part = part.strip()
+            if not part or part.startswith("#"):
+                continue
+            if ("," in part or ";" in part) and "://" not in part.split(",")[0]:
+                # Rare: bare host list — still split.
+                for piece in re.split(r"[,;]+", part):
+                    piece = piece.strip()
+                    if piece:
+                        chunks.append(piece)
+                continue
+            # Full URLs rarely contain unencoded commas in the scheme host; keep whole line
+            # unless it clearly has multiple http(s) tokens.
+            if re.search(r"https?://", part) and len(re.findall(r"https?://", part)) > 1:
+                for m in re.finditer(r"https?://\S+", part):
+                    chunks.append(m.group(0).rstrip(",;"))
+            else:
+                chunks.append(part.rstrip(",;"))
+
+    _push(value)
+    for item in extra:
+        _push(item)
+
+    seen = set()
+    out: List[str] = []
+    for url in chunks:
+        u = str(url or "").strip()
+        if not u or u in seen:
+            continue
+        seen.add(u)
+        out.append(u)
+    return out
+
+
+def resolve_subscription_urls_from_config(config: object) -> List[str]:
+    """Read proxy_subscription_urls (+ legacy proxy_subscription_url) from config dict."""
+    cfg = dict(config or {}) if not isinstance(config, dict) else config
+    urls_raw = cfg.get("proxy_subscription_urls")
+    urls = normalize_subscription_urls(urls_raw)
+    if not urls:
+        urls = normalize_subscription_urls(cfg.get("proxy_subscription_url"))
+    return urls
+
+
+def _node_dedupe_key(node: ParsedNode) -> str:
+    if node.usable_http and node.pool_line:
+        return f"http:{node.pool_line}"
+    raw = str(node.raw or "").strip()
+    if raw:
+        return f"raw:{raw}"
+    return f"{node.scheme}:{node.username}@{node.host}:{node.port}:{node.name}"
+
+
+def _safe_b64_decode(text: str) -> Optional[str]:
+    raw = re.sub(r"\s+", "", str(text or "").strip())
+    if not raw:
+        return None
+    # URL-safe / standard
+    padded = raw + ("=" * ((4 - len(raw) % 4) % 4))
+    for decoder in (base64.urlsafe_b64decode, base64.b64decode):
+        try:
+            data = decoder(padded.encode("ascii", errors="ignore"))
+            if not data:
+                continue
+            # Prefer utf-8 text payloads.
+            try:
+                return data.decode("utf-8")
+            except UnicodeDecodeError:
+                return data.decode("latin-1", errors="replace")
+        except Exception:
+            continue
+    return None
+
+
+def _default_fetch_state_path() -> Path:
+    env = str(os.environ.get(_FETCH_STATE_ENV) or "").strip()
+    if env:
+        return Path(env).expanduser()
+    return Path(__file__).resolve().parent / "data" / "source_fetch_state.json"
+
+
+def load_fetch_state(path: Optional[Union[str, Path]] = None) -> Dict[str, float]:
+    """Map subscription URL → last successful fetch unix timestamp."""
+    target = Path(path) if path else _default_fetch_state_path()
+    try:
+        if not target.is_file():
+            return {}
+        data = json.loads(target.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return {}
+        out: Dict[str, float] = {}
+        for key, value in data.items():
+            try:
+                out[str(key)] = float(value)
+            except (TypeError, ValueError):
+                continue
+        return out
+    except Exception:
+        return {}
+
+
+def save_fetch_state(
+    state: Dict[str, float],
+    path: Optional[Union[str, Path]] = None,
+) -> None:
+    target = Path(path) if path else _default_fetch_state_path()
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        payload = {str(k): float(v) for k, v in (state or {}).items()}
+        target.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+
+
+def should_skip_fetch(
+    url: str,
+    *,
+    interval_seconds: float = _DEFAULT_FETCH_INTERVAL,
+    last_success_at: float = 0.0,
+    now: Optional[float] = None,
+    force: bool = False,
+) -> bool:
+    """True when this URL was fetched successfully within the interval."""
+    if force:
+        return False
+    interval = max(0.0, float(interval_seconds or 0.0))
+    if interval <= 0:
+        return False
+    last = float(last_success_at or 0.0)
+    if last <= 0:
+        return False
+    current = time.time() if now is None else float(now)
+    return (current - last) < interval
+
+
+def fetch_subscription_body(url: str, *, timeout: float = 20.0) -> Tuple[str, str]:
+    """Return (decoded_or_plain_text, body_kind). Uses a process-level opener."""
+    url = str(url or "").strip()
+    if not url:
+        raise ValueError("订阅链接为空")
+    if not (url.startswith("http://") or url.startswith("https://")):
+        raise ValueError("订阅链接必须以 http:// 或 https:// 开头")
+    req = Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (compatible; grok-protocol-proxy-sub/1.0)",
+            "Accept": "*/*",
+        },
+        method="GET",
+    )
+    timeout_s = max(3.0, float(timeout or 20.0))
+    with _OPENER_LOCK:
+        opener = _OPENER
+    with opener.open(req, timeout=timeout_s) as resp:
+        raw = resp.read()
+    text = raw.decode("utf-8", errors="replace").strip()
+    if not text:
+        raise ValueError("订阅内容为空")
+    # Clash YAML detection (parser will try proxies list later)
+    head = text[:3000]
+    if (
+        text.lstrip().startswith("proxies:")
+        or "\nproxies:" in head
+        or text.lstrip().startswith("mixed-port:")
+        or ("\nproxy-groups:" in head and "\nproxies:" in head)
+    ):
+        return text, "clash-yaml"
+    # Many providers return pure base64 without newlines.
+    decoded = _safe_b64_decode(text)
+    if decoded and (
+        "://" in decoded
+        or "\n" in decoded
+        or decoded.lstrip().startswith("proxies:")
+    ):
+        return decoded, "base64"
+    # Sometimes body is base64 of multi-line share links already almost plain.
+    if "://" in text or "host:port" in text.lower():
+        return text, "plain"
+    if decoded:
+        return decoded, "base64"
+    return text, "plain"
+
+
+def _node_name_from_fragment(raw: str) -> str:
+    if "#" not in raw:
+        return ""
+    return unquote(raw.split("#", 1)[1].strip())
+
+
+def _http_pool_line(host: str, port: int, username: str = "", password: str = "", scheme: str = "http") -> str:
+    host = str(host or "").strip()
+    port_i = int(port or 0)
+    if not host or port_i <= 0:
+        return ""
+    user = str(username or "").strip()
+    pwd = str(password or "").strip()
+    scheme = (scheme or "http").lower()
+    if scheme in {"socks5", "socks5h", "socks4"}:
+        # Keep URL form for socks; local_proxy_forwarder/http flow may still reject socks.
+        auth = f"{user}:{pwd}@" if (user or pwd) else ""
+        return f"{scheme}://{auth}{host}:{port_i}"
+    if user or pwd:
+        return f"{host}:{port_i}:{user}:{pwd}"
+    return f"http://{host}:{port_i}"
+
+
+def parse_share_link(raw: str) -> Optional[ParsedNode]:
+    line = str(raw or "").strip()
+    if not line or line.startswith("#"):
+        return None
+    # host:port:user:pass
+    # Strict: avoid Clash YAML list/group lines being misread as proxies.
+    if "://" not in line and not line.lstrip().startswith("-") and line.count(":") >= 3:
+        parts = line.split(":")
+        host, port_s, user = parts[0].strip(), parts[1].strip(), parts[2]
+        password = ":".join(parts[3:])
+        if (
+            host
+            and " " not in host
+            and not host.startswith("#")
+            and re.fullmatch(r"\d{1,5}", port_s or "")
+            and re.fullmatch(r"[A-Za-z0-9._\[\]-]+", host)
+        ):
+            try:
+                port = int(port_s)
+            except ValueError:
+                port = 0
+            if 1 <= port <= 65535:
+                pool = _http_pool_line(host, port, user, password, "http")
+                if pool:
+                    return ParsedNode(
+                        raw=line,
+                        scheme="http",
+                        host=host,
+                        port=port,
+                        username=user,
+                        password=password,
+                        name="",
+                        usable_http=True,
+                        pool_line=pool,
+                    )
+
+    lower = line.lower()
+    name = _node_name_from_fragment(line)
+    if lower.startswith("http://") or lower.startswith("https://") or lower.startswith("socks5://") or lower.startswith("socks5h://") or lower.startswith("socks4://"):
+        parsed = urlparse(line)
+        host = parsed.hostname or ""
+        port = int(parsed.port or (443 if parsed.scheme == "https" else 80))
+        user = unquote(parsed.username or "")
+        pwd = unquote(parsed.password or "")
+        scheme = "socks5" if parsed.scheme.startswith("socks") else "http"
+        pool = _http_pool_line(host, port, user, pwd, scheme)
+        usable = bool(pool) and scheme == "http"
+        note = "" if usable else "socks 节点已解析，但当前注册链路优先支持 HTTP 代理"
+        return ParsedNode(
+            raw=line,
+            scheme=parsed.scheme,
+            host=host,
+            port=port,
+            username=user,
+            password=pwd,
+            name=name,
+            usable_http=usable,
+            pool_line=pool if usable else "",
+            note=note,
+        )
+
+    if lower.startswith("vless://"):
+        # vless://uuid@host:port?params#name
+        body = line[len("vless://"):]
+        main, _, _frag = body.partition("#")
+        cred, _, hostport = main.partition("@")
+        host = hostport
+        port = 0
+        if ":" in hostport:
+            host, port_s = hostport.rsplit(":", 1)
+            # query may follow port if malformed; strip
+            port_s = port_s.split("?", 1)[0]
+            try:
+                port = int(port_s)
+            except ValueError:
+                port = 0
+        if "?" in host:
+            host = host.split("?", 1)[0]
+        return ParsedNode(
+            raw=line,
+            scheme="vless",
+            host=host,
+            port=port,
+            username=cred,
+            name=name,
+            usable_http=False,
+            note="VLESS 需本地客户端/内嵌 mihomo 承接，不能直接写入 HTTP 代理池",
+        )
+
+    if lower.startswith("hy2://") or lower.startswith("hysteria2://"):
+        # hy2://password@host:port?params#name  (also hysteria2://)
+        scheme = "hysteria2"
+        prefix = "hy2://" if lower.startswith("hy2://") else "hysteria2://"
+        body = line[len(prefix):]
+        main, _, _frag = body.partition("#")
+        cred, _, hostport = main.partition("@")
+        # password may be URL-encoded
+        password = unquote(cred.split("?", 1)[0])
+        host = hostport
+        port = 0
+        if ":" in hostport:
+            host, port_s = hostport.rsplit(":", 1)
+            port_s = port_s.split("?", 1)[0]
+            try:
+                port = int(port_s)
+            except ValueError:
+                port = 0
+        if "?" in host:
+            host = host.split("?", 1)[0]
+        return ParsedNode(
+            raw=line,
+            scheme=scheme,
+            host=host,
+            port=port,
+            password=password,
+            name=name,
+            usable_http=False,
+            note="Hysteria2 需内嵌 mihomo / 本地客户端承接，不能直接写入 HTTP 代理池",
+        )
+
+    if lower.startswith("anytls://"):
+        # anytls://password@host:port?params#name
+        body = line[len("anytls://"):]
+        main, _, _frag = body.partition("#")
+        cred, _, hostport = main.partition("@")
+        password = unquote(cred.split("?", 1)[0])
+        host = hostport
+        port = 0
+        if ":" in hostport:
+            host, port_s = hostport.rsplit(":", 1)
+            port_s = port_s.split("?", 1)[0]
+            try:
+                port = int(port_s)
+            except ValueError:
+                port = 0
+        if "?" in host:
+            host = host.split("?", 1)[0]
+        return ParsedNode(
+            raw=line,
+            scheme="anytls",
+            host=host,
+            port=port,
+            password=password,
+            name=name,
+            usable_http=False,
+            note="AnyTLS 需内嵌 mihomo / 本地客户端承接，不能直接写入 HTTP 代理池",
+        )
+
+    if lower.startswith("trojan://"):
+        body = line[len("trojan://"):]
+        main, _, _frag = body.partition("#")
+        cred, _, hostport = main.partition("@")
+        password = unquote(cred.split("?", 1)[0])
+        host, port = hostport, 0
+        if ":" in hostport:
+            host, port_s = hostport.rsplit(":", 1)
+            port_s = port_s.split("?", 1)[0]
+            try:
+                port = int(port_s)
+            except ValueError:
+                port = 0
+        return ParsedNode(
+            raw=line,
+            scheme="trojan",
+            host=host,
+            port=port,
+            password=password,
+            name=name,
+            usable_http=False,
+            note="Trojan 需内嵌 mihomo / 本地客户端承接，不能直接写入 HTTP 代理池",
+        )
+
+    if lower.startswith("ss://"):
+        return ParsedNode(
+            raw=line,
+            scheme="ss",
+            name=name,
+            usable_http=False,
+            note="Shadowsocks 需本地客户端承接，不能直接写入 HTTP 代理池",
+        )
+
+    if lower.startswith("vmess://"):
+        payload = line[len("vmess://"):].strip()
+        decoded = _safe_b64_decode(payload) or ""
+        host = ""
+        port = 0
+        try:
+            data = json.loads(decoded) if decoded else {}
+            if isinstance(data, dict):
+                host = str(data.get("add") or data.get("host") or "")
+                try:
+                    port = int(data.get("port") or 0)
+                except Exception:
+                    port = 0
+                name = str(data.get("ps") or name or "")
+        except Exception:
+            pass
+        return ParsedNode(
+            raw=line,
+            scheme="vmess",
+            host=host,
+            port=port,
+            name=name,
+            usable_http=False,
+            note="VMess 需本地客户端承接，不能直接写入 HTTP 代理池",
+        )
+
+    return None
+
+
+def _as_text(value: object) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def _as_int(value: object, default: int = 0) -> int:
+    try:
+        return int(str(value).strip())
+    except Exception:
+        return int(default)
+
+
+def _as_boolish(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    text = str(value or "").strip().lower()
+    return text in {"1", "true", "yes", "on"}
+
+
+def _clash_query(params: Dict[str, object]) -> str:
+    items = []
+    for key, value in params.items():
+        if value is None:
+            continue
+        if isinstance(value, bool):
+            value = "1" if value else "0"
+        text = str(value).strip()
+        if text == "":
+            continue
+        items.append((key, text))
+    return urlencode(items, doseq=False, quote_via=quote)
+
+
+def _share_link_authority_host(value: object) -> str:
+    """Bracket IPv6 literals for URL authorities without double wrapping."""
+    host = _as_text(value)
+    if host.startswith("[") and host.endswith("]"):
+        return host
+    if ":" in host:
+        return f"[{host}]"
+    return host
+
+
+def _clash_proxy_to_node(item: object) -> Optional[ParsedNode]:
+    """Convert one Clash `proxies:` entry into ParsedNode."""
+    if not isinstance(item, dict):
+        return None
+    ptype = _as_text(item.get("type")).lower()
+    if not ptype:
+        return None
+    name = _as_text(item.get("name") or item.get("ps") or "")
+    server = _as_text(item.get("server") or "")
+    port = _as_int(item.get("port") or 0)
+    username = _as_text(item.get("username") or item.get("user") or "")
+    password = _as_text(item.get("password") or item.get("passwd") or "")
+    uuid = _as_text(item.get("uuid") or item.get("id") or "")
+
+    if ptype in {"http", "https"}:
+        if not server or port <= 0:
+            return None
+        pool = _http_pool_line(server, port, username, password, "http")
+        if not pool:
+            return None
+        raw = pool if not name else f"{pool}#{name}"
+        return ParsedNode(
+            raw=raw,
+            scheme="http",
+            host=server,
+            port=port,
+            username=username,
+            password=password,
+            name=name,
+            usable_http=True,
+            pool_line=pool,
+            note="from clash yaml",
+        )
+
+    if ptype in {"socks5", "socks5h", "socks4", "socks"}:
+        if not server or port <= 0:
+            return None
+        auth = f"{username}:{password}@" if (username or password) else ""
+        raw = f"socks5://{auth}{server}:{port}"
+        if name:
+            raw = f"{raw}#{name}"
+        return ParsedNode(
+            raw=raw,
+            scheme="socks5",
+            host=server,
+            port=port,
+            username=username,
+            password=password,
+            name=name,
+            usable_http=False,
+            pool_line="",
+            note="socks 节点已解析，但当前注册链路优先支持 HTTP 代理",
+        )
+
+    if ptype == "vless":
+        if not server or port <= 0 or not uuid:
+            return None
+        network = _as_text(item.get("network") or "tcp") or "tcp"
+        security = "tls" if _as_boolish(item.get("tls")) else "none"
+        if item.get("reality-opts") or item.get("reality_opts"):
+            security = "reality"
+        params: Dict[str, object] = {
+            "encryption": _as_text(item.get("encryption") or "none") or "none",
+            "type": network,
+            "security": security,
+        }
+        sni = _as_text(item.get("servername") or item.get("sni") or "")
+        if sni:
+            params["sni"] = sni
+            params["servername"] = sni
+        fp = _as_text(
+            item.get("client-fingerprint")
+            or item.get("client_fingerprint")
+            or item.get("fp")
+            or ""
+        )
+        if fp:
+            params["fp"] = fp
+        flow = _as_text(item.get("flow") or "")
+        if flow:
+            params["flow"] = flow
+        alpn = item.get("alpn")
+        if isinstance(alpn, (list, tuple)):
+            alpn_text = ",".join(str(x).strip() for x in alpn if str(x).strip())
+        else:
+            alpn_text = _as_text(alpn)
+        if alpn_text:
+            params["alpn"] = alpn_text
+        if network == "ws":
+            ws = item.get("ws-opts") or item.get("ws_opts") or {}
+            if isinstance(ws, dict):
+                path = _as_text(ws.get("path") or item.get("path") or "/")
+                headers = ws.get("headers") if isinstance(ws.get("headers"), dict) else {}
+                host_header = _as_text(
+                    (headers or {}).get("Host")
+                    or (headers or {}).get("host")
+                    or item.get("host")
+                    or ""
+                )
+            else:
+                path = _as_text(item.get("path") or "/")
+                host_header = _as_text(item.get("host") or "")
+            params["path"] = path or "/"
+            if host_header:
+                params["host"] = host_header
+        elif network == "grpc":
+            grpc = item.get("grpc-opts") or item.get("grpc_opts") or {}
+            service = ""
+            if isinstance(grpc, dict):
+                service = _as_text(
+                    grpc.get("grpc-service-name") or grpc.get("serviceName") or ""
+                )
+            if service:
+                params["serviceName"] = service
+        reality = item.get("reality-opts") or item.get("reality_opts") or {}
+        if isinstance(reality, dict):
+            if reality.get("public-key") or reality.get("public_key"):
+                params["pbk"] = _as_text(reality.get("public-key") or reality.get("public_key"))
+            if reality.get("short-id") or reality.get("short_id"):
+                params["sid"] = _as_text(reality.get("short-id") or reality.get("short_id"))
+            if reality.get("spider-x") or reality.get("spider_x"):
+                params["spx"] = _as_text(reality.get("spider-x") or reality.get("spider_x"))
+        query = _clash_query(params)
+        raw = f"vless://{quote(uuid, safe='')}@{server}:{port}"
+        if query:
+            raw = f"{raw}?{query}"
+        if name:
+            raw = f"{raw}#{quote(name, safe='')}"
+        return ParsedNode(
+            raw=raw,
+            scheme="vless",
+            host=server,
+            port=port,
+            username=uuid,
+            name=name,
+            usable_http=False,
+            note="VLESS 需本地客户端/内嵌 mihomo 承接，不能直接写入 HTTP 代理池",
+        )
+
+    if ptype in {"hysteria2", "hy2"}:
+        if not server or port <= 0:
+            return None
+        secret = password or uuid
+        if not secret:
+            return None
+        params: Dict[str, object] = {}
+        sni = _as_text(item.get("sni") or item.get("servername") or "")
+        if sni:
+            params["sni"] = sni
+        if "skip-cert-verify" in item or "skip_cert_verify" in item:
+            params["insecure"] = (
+                "1"
+                if _as_boolish(item.get("skip-cert-verify", item.get("skip_cert_verify")))
+                else "0"
+            )
+        obfs = _as_text(item.get("obfs") or "")
+        if obfs:
+            params["obfs"] = obfs
+        obfs_password = _as_text(item.get("obfs-password") or item.get("obfs_password") or "")
+        if obfs_password:
+            params["obfs-password"] = obfs_password
+        query = _clash_query(params)
+        raw = f"hysteria2://{quote(secret, safe='')}@{server}:{port}/"
+        if query:
+            raw = f"{raw}?{query}"
+        if name:
+            raw = f"{raw}#{quote(name, safe='')}"
+        return ParsedNode(
+            raw=raw,
+            scheme="hysteria2",
+            host=server,
+            port=port,
+            password=secret,
+            name=name,
+            usable_http=False,
+            note="Hysteria2 需内嵌 mihomo / 本地客户端承接，不能直接写入 HTTP 代理池",
+        )
+
+    if ptype == "trojan":
+        if not server or port <= 0:
+            return None
+        secret = password or uuid
+        if not secret:
+            return None
+        params: Dict[str, object] = {}
+        sni = _as_text(item.get("sni") or item.get("servername") or "")
+        if sni:
+            params["sni"] = sni
+        network = _as_text(item.get("network") or "")
+        if network:
+            params["type"] = network
+        if "skip-cert-verify" in item or "skip_cert_verify" in item or "insecure" in item:
+            insecure = item.get(
+                "insecure", item.get("skip-cert-verify", item.get("skip_cert_verify"))
+            )
+            params["skip-cert-verify"] = _as_boolish(insecure)
+        if "udp" in item:
+            params["udp"] = _as_boolish(item.get("udp"))
+        ip_version = _as_text(item.get("ip-version") or item.get("ip_version") or "")
+        if ip_version:
+            params["ip-version"] = ip_version
+        alpn = item.get("alpn")
+        if isinstance(alpn, (list, tuple)):
+            alpn_text = ",".join(str(x).strip() for x in alpn if str(x).strip())
+        else:
+            alpn_text = _as_text(alpn)
+        if alpn_text:
+            params["alpn"] = alpn_text
+        client_fp = _as_text(
+            item.get("client-fingerprint")
+            or item.get("client_fingerprint")
+            or item.get("fp")
+            or ""
+        )
+        if client_fp:
+            params["client-fingerprint"] = client_fp
+        if network == "ws":
+            ws = item.get("ws-opts") or item.get("ws_opts") or {}
+            if isinstance(ws, dict):
+                params["path"] = _as_text(ws.get("path") or item.get("path") or "/") or "/"
+                headers = ws.get("headers") if isinstance(ws.get("headers"), dict) else {}
+                host_header = _as_text(
+                    (headers or {}).get("Host")
+                    or (headers or {}).get("host")
+                    or item.get("host")
+                    or ""
+                )
+                if host_header:
+                    params["host"] = host_header
+        elif network == "grpc":
+            grpc = item.get("grpc-opts") or item.get("grpc_opts") or {}
+            if isinstance(grpc, dict):
+                service = _as_text(
+                    grpc.get("grpc-service-name") or grpc.get("serviceName") or ""
+                )
+                if service:
+                    params["serviceName"] = service
+        query = _clash_query(params)
+        authority_host = _share_link_authority_host(server)
+        raw = f"trojan://{quote(secret, safe='')}@{authority_host}:{port}"
+        if query:
+            raw = f"{raw}?{query}"
+        if name:
+            raw = f"{raw}#{quote(name, safe='')}"
+        return ParsedNode(
+            raw=raw,
+            scheme="trojan",
+            host=server,
+            port=port,
+            password=secret,
+            name=name,
+            usable_http=False,
+            note="Trojan 需内嵌 mihomo / 本地客户端承接，不能直接写入 HTTP 代理池",
+        )
+
+    if ptype == "anytls":
+        if not server or port <= 0:
+            return None
+        secret = password or uuid
+        if not secret:
+            return None
+        params: Dict[str, object] = {}
+        sni = _as_text(item.get("sni") or item.get("servername") or "")
+        if sni:
+            params["sni"] = sni
+        fp = _as_text(item.get("client-fingerprint") or item.get("fp") or "")
+        if fp:
+            params["fp"] = fp
+        if "skip-cert-verify" in item or "skip_cert_verify" in item or "insecure" in item:
+            insecure = item.get(
+                "insecure", item.get("skip-cert-verify", item.get("skip_cert_verify"))
+            )
+            params["insecure"] = "1" if _as_boolish(insecure) else "0"
+        query = _clash_query(params)
+        raw = f"anytls://{quote(secret, safe='')}@{server}:{port}"
+        if query:
+            raw = f"{raw}?{query}"
+        if name:
+            raw = f"{raw}#{quote(name, safe='')}"
+        return ParsedNode(
+            raw=raw,
+            scheme="anytls",
+            host=server,
+            port=port,
+            password=secret,
+            name=name,
+            usable_http=False,
+            note="AnyTLS 需内嵌 mihomo / 本地客户端承接，不能直接写入 HTTP 代理池",
+        )
+
+    if server and port > 0:
+        return ParsedNode(
+            raw=f"{ptype}://{server}:{port}" + (f"#{name}" if name else ""),
+            scheme=ptype,
+            host=server,
+            port=port,
+            username=username,
+            password=password or uuid,
+            name=name,
+            usable_http=False,
+            note=f"{ptype} 需本地客户端承接，不能直接写入 HTTP 代理池",
+        )
+    return None
+
+
+def parse_clash_yaml_text(text: str) -> List[ParsedNode]:
+    """Parse Clash-like YAML subscription bodies into nodes."""
+    raw = str(text or "").strip()
+    if not raw:
+        return []
+    data = None
+    if yaml is not None:
+        try:
+            data = yaml.safe_load(raw)
+        except Exception:
+            data = None
+    nodes: List[ParsedNode] = []
+    if isinstance(data, dict):
+        proxies = data.get("proxies")
+        if isinstance(proxies, list):
+            for item in proxies:
+                node = _clash_proxy_to_node(item)
+                if node is not None:
+                    nodes.append(node)
+            return nodes
+    if isinstance(data, list):
+        for item in data:
+            node = _clash_proxy_to_node(item)
+            if node is not None:
+                nodes.append(node)
+        if nodes:
+            return nodes
+
+    # Fallback without PyYAML / on parse failure: only real share links.
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if stripped.startswith("- "):
+            maybe = stripped[2:].strip().strip("'\"")
+            if "://" in maybe:
+                node = parse_share_link(maybe)
+                if node is not None:
+                    nodes.append(node)
+            continue
+        if "://" in stripped:
+            node = parse_share_link(stripped)
+            if node is not None:
+                nodes.append(node)
+    return nodes
+
+
+def parse_subscription_text(text: str) -> List[ParsedNode]:
+    raw = str(text or "")
+    stripped = raw.lstrip()
+    looks_clash = (
+        stripped.startswith("proxies:")
+        or "\nproxies:" in raw[:3000]
+        or stripped.startswith("mixed-port:")
+        or stripped.startswith("socks-port:")
+        or ("\nproxy-groups:" in raw[:4000] and "\nproxies:" in raw[:4000])
+    )
+    if looks_clash:
+        nodes = parse_clash_yaml_text(raw)
+        if nodes:
+            return nodes
+
+    nodes: List[ParsedNode] = []
+    for line in raw.splitlines():
+        node = parse_share_link(line.strip())
+        if node is not None:
+            nodes.append(node)
+    return nodes
+
+
+def import_proxy_subscription(
+    url: str,
+    *,
+    timeout: float = 20.0,
+    include_inventory_comments: bool = True,
+    force: bool = False,
+    interval_seconds: float = 0.0,
+) -> SubscriptionImportResult:
+    """Fetch a single subscription URL. Prefer import_proxy_subscriptions for multi-URL."""
+    return import_proxy_subscriptions(
+        [url],
+        timeout=timeout,
+        include_inventory_comments=include_inventory_comments,
+        force=force,
+        default_interval_seconds=interval_seconds,
+    )
+
+
+def _fetch_one_url(
+    sub_url: str,
+    *,
+    timeout: float,
+) -> Tuple[str, str, List[ParsedNode], int, Optional[str]]:
+    """Return (url, body_kind, nodes, line_count, error)."""
+    try:
+        body, kind = fetch_subscription_body(sub_url, timeout=timeout)
+        nodes = parse_subscription_text(body)
+        lines = [ln.strip() for ln in body.splitlines() if ln.strip()]
+        return sub_url, kind, nodes, len(lines), None
+    except Exception as exc:
+        return sub_url, "", [], 0, str(exc) or exc.__class__.__name__
+
+
+def import_proxy_subscriptions(
+    urls: Union[str, Sequence[object], None],
+    *,
+    timeout: float = 20.0,
+    include_inventory_comments: bool = True,
+    max_workers: int = 8,
+    force: bool = False,
+    default_interval_seconds: float = 0.0,
+    per_url_intervals: Optional[Dict[str, float]] = None,
+    fetch_state_path: Optional[Union[str, Path]] = None,
+    existing_pool_lines: Optional[Sequence[str]] = None,
+) -> SubscriptionImportResult:
+    """Fetch one or more subscription URLs and merge nodes into one result.
+
+    Per-URL failures are recorded in warnings/per_url and do not abort siblings.
+    Raises ValueError only when no valid URL is provided, or every URL fails
+    (skipped-by-interval alone does not count as success).
+
+    P0/P1 options:
+      - ``max_workers``: concurrent fetches (default 8).
+      - ``default_interval_seconds`` / ``per_url_intervals``: min seconds between
+        successful pulls for a URL (0 = no throttle).
+      - ``force``: ignore intervals.
+      - ``existing_pool_lines``: when set, ``usable_pool_lines`` only contains
+        newly seen HTTP lines (fetch_and_merge_new style).
+    """
+    url_list = normalize_subscription_urls(urls)
+    if not url_list:
+        raise ValueError("订阅链接为空")
+
+    for u in url_list:
+        if not (u.startswith("http://") or u.startswith("https://")):
+            raise ValueError(f"订阅链接必须以 http:// 或 https:// 开头: {u}")
+
+    intervals = dict(per_url_intervals or {})
+    state = load_fetch_state(fetch_state_path)
+    now = time.time()
+
+    to_fetch: List[str] = []
+    skipped_entries: List[Dict[str, object]] = []
+    for sub_url in url_list:
+        interval = float(intervals.get(sub_url, default_interval_seconds or 0.0))
+        last = float(state.get(sub_url) or 0.0)
+        if should_skip_fetch(
+            sub_url,
+            interval_seconds=interval,
+            last_success_at=last,
+            now=now,
+            force=force,
+        ):
+            skipped_entries.append(
+                {
+                    "url": sub_url,
+                    "ok": True,
+                    "skipped": True,
+                    "reason": "interval",
+                    "interval_seconds": interval,
+                    "last_success_at": last,
+                    "node_count": 0,
+                    "usable_http": 0,
+                    "body_kind": "",
+                    "error": "",
+                }
+            )
+        else:
+            to_fetch.append(sub_url)
+
+    merged = SubscriptionImportResult(url=url_list[0], urls=list(url_list))
+    kinds: List[str] = []
+    node_seen: set = set()
+    pool: List[str] = []
+    pool_seen: set = set()
+    existing_seen: Set[str] = set(str(x) for x in (existing_pool_lines or []) if str(x))
+    new_only: List[str] = []
+    any_ok = False
+    fatal_errors: List[str] = []
+    state_dirty = False
+
+    workers = max(1, min(int(max_workers or 1), max(1, len(to_fetch))))
+    results: List[Tuple[str, str, List[ParsedNode], int, Optional[str]]] = []
+    if to_fetch:
+        if len(to_fetch) == 1 or workers == 1:
+            for sub_url in to_fetch:
+                results.append(_fetch_one_url(sub_url, timeout=timeout))
+        else:
+            with ThreadPoolExecutor(max_workers=workers) as pool_exec:
+                futs = {
+                    pool_exec.submit(_fetch_one_url, sub_url, timeout=timeout): sub_url
+                    for sub_url in to_fetch
+                }
+                for fut in as_completed(futs):
+                    results.append(fut.result())
+
+    # Preserve input URL order in per_url reporting.
+    result_by_url = {item[0]: item for item in results}
+    for sub_url in url_list:
+        skip = next((e for e in skipped_entries if e["url"] == sub_url), None)
+        if skip is not None:
+            merged.per_url.append(skip)
+            # Interval skip is intentional; treat as non-fatal soft success so a
+            # full-skip run does not raise when state is warm.
+            any_ok = True
+            continue
+        if sub_url not in result_by_url:
+            continue
+        _url, kind, nodes, line_count, err = result_by_url[sub_url]
+        entry: Dict[str, object] = {
+            "url": sub_url,
+            "ok": False,
+            "skipped": False,
+            "node_count": 0,
+            "usable_http": 0,
+            "body_kind": "",
+            "error": "",
+        }
+        if err:
+            entry["error"] = err
+            fatal_errors.append(f"{sub_url}: {err}")
+            merged.warnings.append(f"订阅拉取失败: {sub_url} → {err}")
+            merged.per_url.append(entry)
+            continue
+        usable = 0
+        for node in nodes:
+            key = _node_dedupe_key(node)
+            if key not in node_seen:
+                node_seen.add(key)
+                merged.nodes.append(node)
+            if node.usable_http and node.pool_line:
+                if node.pool_line not in pool_seen:
+                    pool_seen.add(node.pool_line)
+                    pool.append(node.pool_line)
+                    usable += 1
+                    if node.pool_line not in existing_seen:
+                        new_only.append(node.pool_line)
+            elif not node.usable_http:
+                merged.skipped.append(
+                    f"{node.scheme}://{node.host}:{node.port} {node.name}".strip()
+                )
+        merged.total_lines += line_count
+        kinds.append(kind)
+        entry.update(
+            {
+                "ok": True,
+                "node_count": len(nodes),
+                "usable_http": usable,
+                "body_kind": kind,
+            }
+        )
+        merged.per_url.append(entry)
+        any_ok = True
+        state[sub_url] = time.time()
+        state_dirty = True
+
+    if state_dirty:
+        save_fetch_state(state, fetch_state_path)
+
+    if not any_ok:
+        raise ValueError("全部订阅链接拉取失败: " + "; ".join(fatal_errors[:5]))
+
+    merged.body_kind = "+".join(dict.fromkeys(kinds)) if kinds else ""
+    header: List[str] = [
+        f"# subscription imported from {len(url_list)} url(s)",
+        f"# urls={', '.join(url_list)}",
+        f"# body_kind={merged.body_kind} nodes={len(merged.nodes)} usable_http={len(pool)}",
+    ]
+    if include_inventory_comments:
+        for node in merged.nodes[:80]:
+            label = node.name or f"{node.host}:{node.port}"
+            flag = "http" if node.usable_http else "need-client"
+            header.append(
+                f"# [{flag}] {node.scheme} {label} {node.host}:{node.port}".rstrip(":")
+            )
+        if len(merged.nodes) > 80:
+            header.append(f"# ... {len(merged.nodes) - 80} more nodes omitted")
+
+    if not pool and any(not e.get("skipped") for e in merged.per_url):
+        merged.warnings.append(
+            "订阅已拉取，但没有可直接用于注册机的 HTTP 代理节点。"
+            "当前节点多为 VLESS/Hysteria2/AnyTLS/VMess/SS/Trojan，"
+            "可走内嵌 mihomo（VLESS/Hysteria2/AnyTLS/Trojan）或本地客户端 HTTP 入口。"
+        )
+    if existing_pool_lines is not None:
+        merged.usable_pool_lines = list(new_only)
+    else:
+        merged.usable_pool_lines = list(pool)
+    merged.pool_lines = header + pool
+    return merged
+
+
+def fetch_and_merge_new(
+    urls: Union[str, Sequence[object], None],
+    existing_pool_lines: Sequence[str],
+    **kwargs: object,
+) -> List[str]:
+    """Fetch subscriptions and return only newly seen HTTP pool lines."""
+    result = import_proxy_subscriptions(
+        urls,
+        existing_pool_lines=existing_pool_lines,
+        **kwargs,  # type: ignore[arg-type]
+    )
+    return list(result.usable_pool_lines)
+
+
+def check_proxies_concurrent(
+    proxy_urls: Sequence[str],
+    *,
+    check_url: str = "https://httpbin.org/ip",
+    timeout: float = 10.0,
+    max_workers: int = 50,
+) -> Dict[str, Dict[str, object]]:
+    """Concurrent HTTP proxy health check (P0).
+
+    Returns ``{proxy_url: {ok, latency_ms, error}}``.
+    Uses stdlib urllib only so the standalone package stays light.
+    """
+    urls = [str(u).strip() for u in (proxy_urls or []) if str(u).strip()]
+    if not urls:
+        return {}
+
+    def _one(proxy: str) -> Tuple[str, Dict[str, object]]:
+        started = time.time()
+        try:
+            handler_mod = __import__("urllib.request", fromlist=["ProxyHandler", "build_opener", "Request"])
+            proxy_handler = handler_mod.ProxyHandler({"http": proxy, "https": proxy})
+            opener = handler_mod.build_opener(proxy_handler)
+            req = handler_mod.Request(
+                check_url,
+                headers={"User-Agent": "proxy-pool-health/1.0"},
+                method="GET",
+            )
+            with opener.open(req, timeout=max(0.5, float(timeout))) as resp:
+                _ = resp.read(64)
+            return proxy, {
+                "ok": True,
+                "latency_ms": (time.time() - started) * 1000.0,
+                "error": "",
+            }
+        except Exception as exc:
+            return proxy, {
+                "ok": False,
+                "latency_ms": (time.time() - started) * 1000.0,
+                "error": str(exc) or exc.__class__.__name__,
+            }
+
+    workers = max(1, min(int(max_workers or 1), len(urls), 64))
+    out: Dict[str, Dict[str, object]] = {}
+    with ThreadPoolExecutor(max_workers=workers) as pool_exec:
+        futs = [pool_exec.submit(_one, proxy) for proxy in urls]
+        for fut in as_completed(futs):
+            proxy, result = fut.result()
+            out[proxy] = result
+    return out
+
+
+# ---------------------------------------------------------------------------
+# P3: asyncio paths (stdlib-only; optional aiohttp if present for health checks)
+# ---------------------------------------------------------------------------
+
+
+async def import_proxy_subscriptions_async(
+    urls: Union[str, Sequence[object], None],
+    **kwargs: object,
+) -> SubscriptionImportResult:
+    """Async wrapper: runs concurrent sync fetches in a thread pool.
+
+    Keeps parsing/state logic identical to :func:`import_proxy_subscriptions`
+    without requiring aiohttp. Suitable for embedding in asyncio apps.
+    """
+    import asyncio
+
+    return await asyncio.to_thread(import_proxy_subscriptions, urls, **kwargs)  # type: ignore[arg-type]
+
+
+async def fetch_and_merge_new_async(
+    urls: Union[str, Sequence[object], None],
+    existing_pool_lines: Sequence[str],
+    **kwargs: object,
+) -> List[str]:
+    import asyncio
+
+    return await asyncio.to_thread(
+        fetch_and_merge_new,
+        urls,
+        existing_pool_lines,
+        **kwargs,  # type: ignore[arg-type]
+    )
+
+
+async def check_proxies_async(
+    proxy_urls: Sequence[str],
+    *,
+    check_url: str = "https://httpbin.org/ip",
+    timeout: float = 10.0,
+    concurrency: int = 50,
+) -> Dict[str, Dict[str, object]]:
+    """Async concurrent proxy health check (P3).
+
+    Prefers ``aiohttp`` when installed; otherwise falls back to
+    :func:`asyncio.to_thread` + :func:`check_proxies_concurrent`.
+    """
+    import asyncio
+
+    urls = [str(u).strip() for u in (proxy_urls or []) if str(u).strip()]
+    if not urls:
+        return {}
+
+    try:
+        import aiohttp  # type: ignore
+    except Exception:
+        return await asyncio.to_thread(
+            check_proxies_concurrent,
+            urls,
+            check_url=check_url,
+            timeout=timeout,
+            max_workers=concurrency,
+        )
+
+    sem = asyncio.Semaphore(max(1, min(int(concurrency or 1), 256)))
+    out: Dict[str, Dict[str, object]] = {}
+
+    async def _one(session: "aiohttp.ClientSession", proxy: str) -> None:
+        started = time.time()
+        try:
+            async with sem:
+                async with session.get(
+                    check_url,
+                    proxy=proxy,
+                    timeout=aiohttp.ClientTimeout(total=max(0.5, float(timeout))),
+                    ssl=False,
+                ) as resp:
+                    await resp.read()
+            out[proxy] = {
+                "ok": True,
+                "latency_ms": (time.time() - started) * 1000.0,
+                "error": "",
+            }
+        except Exception as exc:
+            out[proxy] = {
+                "ok": False,
+                "latency_ms": (time.time() - started) * 1000.0,
+                "error": str(exc) or exc.__class__.__name__,
+            }
+
+    async with aiohttp.ClientSession(
+        headers={"User-Agent": "proxy-pool-health-async/1.0"}
+    ) as session:
+        await asyncio.gather(*[_one(session, p) for p in urls])
+    return out
