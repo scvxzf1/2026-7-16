@@ -29,6 +29,8 @@ _PROXY_MARKERS = (
     "tls handshake",
     "ssl handshake",
     "remote end closed connection without response",
+    "cloudflare challenge",
+    "just a moment...",
 )
 _AUTH_MARKERS = (
     "authenticationerror",
@@ -37,6 +39,9 @@ _AUTH_MARKERS = (
     "invalid login",
     "login required",
     "credentials required",
+    "authenticated cookies needed",
+    "could not authenticate you",
+    "not authenticated",
     "insufficient privileges",
 )
 _PROXY_ACCESS_MARKERS = (

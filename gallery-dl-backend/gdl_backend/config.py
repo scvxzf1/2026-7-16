@@ -40,7 +40,11 @@ class ServerSettings:
 @dataclass(slots=True)
 class GallerySettings:
     repo_path: Path = field(default_factory=lambda: (WORKSPACE_DIR / "gallery-dl-codeberg").resolve())
+    cache_file: Path = field(
+        default_factory=lambda: (PROJECT_DIR / "credentials" / "managed" / "gallery-dl-cache.sqlite3").resolve()
+    )
     python_executable: str = sys.executable
+    migrate_default_auth: bool = True
     default_http_timeout: float = 30.0
     default_retries: int = 2
     terminate_grace_seconds: float = 5.0
@@ -65,6 +69,7 @@ class GallerySettings:
             "--cookies",
             "--cookies-export",
             "--cookies-from-browser",
+            "--cache-file",
             "--username",
             "--password",
             "-d",
@@ -77,6 +82,13 @@ class GallerySettings:
             "-p",
         ]
     )
+
+
+@dataclass(slots=True)
+class AuthSettings:
+    chrome_executable: str = ""
+    browser_login_timeout_seconds: float = 900.0
+    browser_poll_interval_seconds: float = 1.0
 
 
 @dataclass(slots=True)
@@ -106,7 +118,7 @@ class ProxySettings:
 
 @dataclass(slots=True)
 class SchedulerSettings:
-    max_concurrent_tasks: int = 4
+    max_concurrent_tasks: int = 20
     poll_interval_seconds: float = 0.5
     shutdown_grace_seconds: float = 15.0
     max_logs_per_task: int = 5000
@@ -114,7 +126,7 @@ class SchedulerSettings:
 
 
 DEFAULT_SITE_POLICY: dict[str, Any] = {
-    "max_concurrency": 2,
+    "max_concurrency": 20,
     "retry_limit": 2,
     "backoff_base_seconds": 2.0,
     "proxy_mode": "prefer",
@@ -140,6 +152,7 @@ class AppSettings:
     allowed_cookie_roots: list[Path] = field(default_factory=lambda: [(PROJECT_DIR / "credentials").resolve()])
     server: ServerSettings = field(default_factory=ServerSettings)
     gallery: GallerySettings = field(default_factory=GallerySettings)
+    auth: AuthSettings = field(default_factory=AuthSettings)
     proxy: ProxySettings = field(default_factory=ProxySettings)
     scheduler: SchedulerSettings = field(default_factory=SchedulerSettings)
     default_site_policy: dict[str, Any] = field(default_factory=lambda: dict(DEFAULT_SITE_POLICY))
@@ -160,6 +173,7 @@ class AppSettings:
 
         server_data = dict(data.get("server") or {})
         gallery_data = dict(data.get("gallery") or {})
+        auth_data = dict(data.get("auth") or {})
         proxy_data = dict(data.get("proxy") or {})
         scheduler_data = dict(data.get("scheduler") or {})
 
@@ -172,12 +186,27 @@ class AppSettings:
         )
         gallery = GallerySettings(
             repo_path=_path(gallery_data.get("repo_path"), base, WORKSPACE_DIR / "gallery-dl-codeberg"),
+            cache_file=_path(
+                gallery_data.get("cache_file"),
+                base,
+                PROJECT_DIR / "credentials" / "managed" / "gallery-dl-cache.sqlite3",
+            ),
             python_executable=str(gallery_data.get("python_executable") or sys.executable),
+            migrate_default_auth=bool(gallery_data.get("migrate_default_auth", True)),
             default_http_timeout=float(gallery_data.get("default_http_timeout", 30.0)),
             default_retries=int(gallery_data.get("default_retries", 2)),
             terminate_grace_seconds=float(gallery_data.get("terminate_grace_seconds", 5.0)),
             max_log_line_chars=int(gallery_data.get("max_log_line_chars", 4000)),
             forbidden_args=[str(x) for x in gallery_data.get("forbidden_args", GallerySettings().forbidden_args)],
+        )
+        auth = AuthSettings(
+            chrome_executable=str(auth_data.get("chrome_executable") or ""),
+            browser_login_timeout_seconds=float(
+                auth_data.get("browser_login_timeout_seconds", 900.0)
+            ),
+            browser_poll_interval_seconds=float(
+                auth_data.get("browser_poll_interval_seconds", 1.0)
+            ),
         )
         node_file_value = proxy_data.get("node_file")
         transport_core_binary = proxy_data.get("transport_core_binary", "bin/proxy-core.exe")
@@ -206,7 +235,7 @@ class AppSettings:
             ),
         )
         scheduler = SchedulerSettings(
-            max_concurrent_tasks=max(1, int(scheduler_data.get("max_concurrent_tasks", 4))),
+            max_concurrent_tasks=max(1, int(scheduler_data.get("max_concurrent_tasks", 20))),
             poll_interval_seconds=max(0.1, float(scheduler_data.get("poll_interval_seconds", 0.5))),
             shutdown_grace_seconds=max(1.0, float(scheduler_data.get("shutdown_grace_seconds", 15.0))),
             max_logs_per_task=max(100, int(scheduler_data.get("max_logs_per_task", 5000))),
@@ -224,6 +253,7 @@ class AppSettings:
             allowed_cookie_roots=_paths(data.get("allowed_cookie_roots"), base, [PROJECT_DIR / "credentials"]),
             server=server,
             gallery=gallery,
+            auth=auth,
             proxy=proxy,
             scheduler=scheduler,
             default_site_policy=policy,
@@ -241,6 +271,10 @@ class AppSettings:
             raise ValueError("监听非回环地址时必须配置 server.api_key")
         if self.proxy.engine != "native":
             raise ValueError("proxy.engine 当前支持 native")
+        if self.auth.browser_login_timeout_seconds <= 0:
+            raise ValueError("auth.browser_login_timeout_seconds 必须大于 0")
+        if self.auth.browser_poll_interval_seconds <= 0:
+            raise ValueError("auth.browser_poll_interval_seconds 必须大于 0")
         if not 1 <= int(self.proxy.max_nodes) <= 10000:
             raise ValueError("proxy.max_nodes 必须位于 1..10000")
         if not 1 <= int(self.proxy.probe_workers) <= 64:
@@ -266,6 +300,7 @@ class AppSettings:
             self.default_output_root,
             self.runtime_dir / "logs",
             self.runtime_dir / "proxy",
+            self.gallery.cache_file.parent,
         ):
             path.mkdir(parents=True, exist_ok=True)
 
@@ -318,6 +353,13 @@ class AppSettings:
                 "python_executable": self.gallery.python_executable,
                 "default_http_timeout": self.gallery.default_http_timeout,
                 "default_retries": self.gallery.default_retries,
+                "managed_auth_cache": True,
+            },
+            "auth": {
+                "managed_browser": True,
+                "chrome_configured": bool(self.auth.chrome_executable.strip()),
+                "browser_login_timeout_seconds": self.auth.browser_login_timeout_seconds,
+                "browser_poll_interval_seconds": self.auth.browser_poll_interval_seconds,
             },
             "proxy": {
                 "enabled": self.proxy.enabled,

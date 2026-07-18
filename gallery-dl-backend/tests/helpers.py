@@ -18,6 +18,8 @@ def make_settings(root: Path) -> AppSettings:
     settings.allowed_config_roots = [root / "credentials"]
     settings.allowed_cookie_roots = [root / "credentials"]
     settings.gallery.repo_path = WORKSPACE / "gallery-dl-codeberg"
+    settings.gallery.cache_file = root / "credentials" / "managed" / "gallery-dl-cache.sqlite3"
+    settings.gallery.migrate_default_auth = False
     settings.proxy.enabled = False
     settings.proxy.auto_start = False
     settings.server.allow_private_targets = True

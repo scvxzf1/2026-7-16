@@ -46,6 +46,10 @@ class SiteAndGalleryTests(unittest.TestCase):
             )
             self.assertIn("gdl_backend.worker_entry", command)
             self.assertIn("--proxy", command)
+            self.assertIn("--cache-file", command)
+            self.assertIn(str(settings.gallery.cache_file), command)
+            with self.assertRaises(ValueError):
+                runner.validate_args(["--cache-file", "other.sqlite3"])
 
     def test_worker_entry_loads_local_gallery_source(self):
         command = [

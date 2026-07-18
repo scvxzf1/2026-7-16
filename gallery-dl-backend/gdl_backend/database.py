@@ -137,6 +137,75 @@ class Database:
                 policy_json TEXT NOT NULL,
                 updated_at REAL NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS crawl_batches (
+                id TEXT PRIMARY KEY,
+                idempotency_key TEXT UNIQUE,
+                status TEXT NOT NULL,
+                output_dir TEXT NOT NULL,
+                concurrency INTEGER NOT NULL,
+                max_tasks INTEGER NOT NULL,
+                task_count INTEGER NOT NULL DEFAULT 0,
+                succeeded_task_count INTEGER NOT NULL DEFAULT 0,
+                failed_task_count INTEGER NOT NULL DEFAULT 0,
+                cancelled_task_count INTEGER NOT NULL DEFAULT 0,
+                cancel_requested INTEGER NOT NULL DEFAULT 0,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                started_at REAL,
+                finished_at REAL,
+                last_error TEXT NOT NULL DEFAULT ''
+            );
+            CREATE INDEX IF NOT EXISTS idx_crawl_batches_status
+                ON crawl_batches(status, created_at);
+
+            CREATE TABLE IF NOT EXISTS crawl_addresses (
+                id TEXT PRIMARY KEY,
+                batch_id TEXT NOT NULL REFERENCES crawl_batches(id) ON DELETE CASCADE,
+                site TEXT NOT NULL,
+                source_order INTEGER NOT NULL,
+                address_order INTEGER NOT NULL,
+                url TEXT NOT NULL,
+                label TEXT NOT NULL DEFAULT '',
+                address_type TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL,
+                proxy_mode TEXT NOT NULL,
+                max_attempts INTEGER NOT NULL,
+                priority INTEGER NOT NULL DEFAULT 0,
+                credentials_ref TEXT,
+                cookies_file TEXT,
+                config_file TEXT,
+                extra_args_json TEXT NOT NULL DEFAULT '[]',
+                discovery_args_json TEXT NOT NULL DEFAULT '[]',
+                timeout_seconds REAL NOT NULL DEFAULT 180,
+                planned_task_count INTEGER NOT NULL DEFAULT 0,
+                succeeded_task_count INTEGER NOT NULL DEFAULT 0,
+                failed_task_count INTEGER NOT NULL DEFAULT 0,
+                cancelled_task_count INTEGER NOT NULL DEFAULT 0,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                started_at REAL,
+                finished_at REAL,
+                last_error TEXT NOT NULL DEFAULT '',
+                UNIQUE(batch_id, source_order, address_order)
+            );
+            CREATE INDEX IF NOT EXISTS idx_crawl_addresses_batch_order
+                ON crawl_addresses(batch_id, source_order, address_order);
+            CREATE INDEX IF NOT EXISTS idx_crawl_addresses_status
+                ON crawl_addresses(status, updated_at);
+
+            CREATE TABLE IF NOT EXISTS crawl_address_tasks (
+                address_id TEXT NOT NULL REFERENCES crawl_addresses(id) ON DELETE CASCADE,
+                task_id TEXT NOT NULL UNIQUE REFERENCES tasks(id) ON DELETE CASCADE,
+                sequence_no INTEGER NOT NULL,
+                created_at REAL NOT NULL,
+                PRIMARY KEY(address_id, task_id),
+                UNIQUE(address_id, sequence_no)
+            );
+            CREATE INDEX IF NOT EXISTS idx_crawl_address_tasks_address
+                ON crawl_address_tasks(address_id, sequence_no);
+
+            UPDATE meta SET value='2' WHERE key='schema_version';
             """
         )
 
@@ -177,6 +246,28 @@ class Database:
             return None
         data = dict(row)
         data["retryable"] = bool(data.get("retryable"))
+        return data
+
+    @staticmethod
+    def _crawl_batch(row: sqlite3.Row | None) -> dict[str, Any] | None:
+        if row is None:
+            return None
+        data = dict(row)
+        data["cancel_requested"] = bool(data.get("cancel_requested"))
+        return data
+
+    @staticmethod
+    def _crawl_address(row: sqlite3.Row | None) -> dict[str, Any] | None:
+        if row is None:
+            return None
+        data = dict(row)
+        for key in ("extra_args_json", "discovery_args_json"):
+            target = key.removesuffix("_json")
+            try:
+                data[target] = json.loads(data.pop(key) or "[]")
+            except Exception:
+                data[target] = []
+                data.pop(key, None)
         return data
 
     def close(self) -> None:
@@ -616,6 +707,541 @@ class Database:
                 "UPDATE tasks SET artifact_count=?, artifact_bytes=?, updated_at=? WHERE id=?",
                 (max(0, int(count)), max(0, int(total_bytes)), time.time(), task_id),
             )
+
+    def create_crawl_batch(
+        self,
+        values: dict[str, Any],
+        addresses: list[dict[str, Any]],
+        *,
+        idempotency_key: str | None = None,
+    ) -> tuple[str, bool]:
+        now = time.time()
+        with self._transaction() as conn:
+            if idempotency_key:
+                existing = conn.execute(
+                    "SELECT id FROM crawl_batches WHERE idempotency_key=?",
+                    (idempotency_key,),
+                ).fetchone()
+                if existing is not None:
+                    return str(existing["id"]), False
+            batch_id = str(values.get("id") or uuid.uuid4())
+            conn.execute(
+                """
+                INSERT INTO crawl_batches(
+                    id, idempotency_key, status, output_dir, concurrency, max_tasks,
+                    created_at, updated_at
+                ) VALUES (?, ?, 'queued', ?, ?, ?, ?, ?)
+                """,
+                (
+                    batch_id,
+                    idempotency_key,
+                    values["output_dir"],
+                    int(values["concurrency"]),
+                    int(values["max_tasks"]),
+                    now,
+                    now,
+                ),
+            )
+            for address in addresses:
+                conn.execute(
+                    """
+                    INSERT INTO crawl_addresses(
+                        id, batch_id, site, source_order, address_order, url, label,
+                        address_type, status, proxy_mode, max_attempts, priority,
+                        credentials_ref, cookies_file, config_file, extra_args_json,
+                        discovery_args_json, timeout_seconds, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        address["id"],
+                        batch_id,
+                        address["site"],
+                        int(address["source_order"]),
+                        int(address["address_order"]),
+                        address["url"],
+                        address.get("label", ""),
+                        address.get("address_type", ""),
+                        address["proxy_mode"],
+                        int(address["max_attempts"]),
+                        int(address.get("priority", 0)),
+                        address.get("credentials_ref"),
+                        address.get("cookies_file"),
+                        address.get("config_file"),
+                        json.dumps(address.get("extra_args", []), ensure_ascii=False),
+                        json.dumps(address.get("discovery_args", []), ensure_ascii=False),
+                        float(address.get("timeout_seconds", 180.0)),
+                        now,
+                        now,
+                    ),
+                )
+            return batch_id, True
+
+    def get_crawl_batch_by_idempotency(self, key: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id FROM crawl_batches WHERE idempotency_key=?",
+                (key,),
+            ).fetchone()
+        return self.get_crawl_batch(str(row["id"])) if row else None
+
+    def get_crawl_batch(self, batch_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM crawl_batches WHERE id=?",
+                (batch_id,),
+            ).fetchone()
+            batch = self._crawl_batch(row)
+            if batch is None:
+                return None
+            rows = self._conn.execute(
+                """
+                SELECT * FROM crawl_addresses
+                WHERE batch_id=? ORDER BY source_order, address_order
+                """,
+                (batch_id,),
+            ).fetchall()
+            addresses = [self._crawl_address(item) for item in rows]
+
+        sources: list[dict[str, Any]] = []
+        source_index: dict[int, dict[str, Any]] = {}
+        current: dict[str, Any] | None = None
+        terminal = {"succeeded", "failed", "cancelled"}
+        for address in addresses:
+            if address is None:
+                continue
+            order = int(address["source_order"])
+            group = source_index.get(order)
+            if group is None:
+                group = {
+                    "order": order,
+                    "site": address["site"],
+                    "status": "pending",
+                    "addresses": [],
+                }
+                source_index[order] = group
+                sources.append(group)
+            group["addresses"].append(address)
+            if current is None and address["status"] not in terminal:
+                current = {
+                    "source_order": order,
+                    "address_order": address["address_order"],
+                    "address_id": address["id"],
+                    "site": address["site"],
+                    "url": address["url"],
+                    "status": address["status"],
+                }
+        for group in sources:
+            statuses = [item["status"] for item in group["addresses"]]
+            if all(status == "succeeded" for status in statuses):
+                group["status"] = "succeeded"
+            elif any(status in {"planning", "running"} for status in statuses):
+                group["status"] = "running"
+            elif any(status == "failed" for status in statuses) and all(status in terminal for status in statuses):
+                group["status"] = "completed_with_errors"
+            elif all(status == "cancelled" for status in statuses):
+                group["status"] = "cancelled"
+        batch["sources"] = sources
+        batch["source_count"] = len(sources)
+        batch["address_count"] = sum(len(item["addresses"]) for item in sources)
+        batch["current"] = current
+        batch["execution_order"] = "source_then_address"
+        batch["lease_model"] = "one-media-task-one-node"
+        return batch
+
+    def list_crawl_batches(self, *, limit: int = 50, offset: int = 0) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT * FROM crawl_batches
+                ORDER BY created_at DESC LIMIT ? OFFSET ?
+                """,
+                (max(1, min(int(limit), 500)), max(0, int(offset))),
+            ).fetchall()
+            return [self._crawl_batch(row) for row in rows]  # type: ignore[misc]
+
+    def active_crawl_batch_ids(self) -> list[str]:
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT id FROM crawl_batches
+                WHERE status IN ('queued','running','cancelling')
+                ORDER BY created_at
+                """
+            ).fetchall()
+            return [str(row["id"]) for row in rows]
+
+    def next_crawl_address(self, batch_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT * FROM crawl_addresses
+                WHERE batch_id=? AND status NOT IN ('succeeded','failed','cancelled')
+                ORDER BY source_order, address_order LIMIT 1
+                """,
+                (batch_id,),
+            ).fetchone()
+            return self._crawl_address(row)
+
+    def begin_crawl_address_planning(self, address_id: str) -> bool:
+        now = time.time()
+        with self._transaction() as conn:
+            row = conn.execute(
+                "SELECT batch_id FROM crawl_addresses WHERE id=?",
+                (address_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            cur = conn.execute(
+                """
+                UPDATE crawl_addresses SET status='planning', started_at=COALESCE(started_at, ?),
+                    updated_at=?, last_error=''
+                WHERE id=? AND status='pending'
+                """,
+                (now, now, address_id),
+            )
+            if cur.rowcount:
+                conn.execute(
+                    """
+                    UPDATE crawl_batches SET status='running', started_at=COALESCE(started_at, ?),
+                        updated_at=? WHERE id=? AND cancel_requested=0
+                    """,
+                    (now, now, row["batch_id"]),
+                )
+            return bool(cur.rowcount)
+
+    def link_crawl_task(self, address_id: str, task_id: str, sequence_no: int) -> None:
+        now = time.time()
+        with self._transaction() as conn:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO crawl_address_tasks(address_id, task_id, sequence_no, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (address_id, task_id, int(sequence_no), now),
+            )
+            row = conn.execute(
+                "SELECT batch_id FROM crawl_addresses WHERE id=?",
+                (address_id,),
+            ).fetchone()
+            if row:
+                conn.execute(
+                    """
+                    UPDATE crawl_batches SET task_count=(
+                        SELECT COUNT(*) FROM crawl_address_tasks cat
+                        JOIN crawl_addresses ca ON ca.id=cat.address_id
+                        WHERE ca.batch_id=crawl_batches.id
+                    ), updated_at=? WHERE id=?
+                    """,
+                    (now, row["batch_id"]),
+                )
+
+    def mark_crawl_address_running(self, address_id: str, *, last_error: str = "") -> bool:
+        now = time.time()
+        with self._transaction() as conn:
+            count = int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM crawl_address_tasks WHERE address_id=?",
+                    (address_id,),
+                ).fetchone()[0]
+            )
+            if count <= 0:
+                return False
+            cur = conn.execute(
+                """
+                UPDATE crawl_addresses SET status='running', planned_task_count=?, updated_at=?,
+                    last_error=?
+                WHERE id=? AND status='planning'
+                """,
+                (count, now, redact_text(last_error, limit=2000), address_id),
+            )
+            return bool(cur.rowcount)
+
+    def reset_crawl_address_planning(self, address_id: str, error: str = "") -> bool:
+        with self._transaction() as conn:
+            cur = conn.execute(
+                """
+                UPDATE crawl_addresses SET status='pending', updated_at=?, last_error=?
+                WHERE id=? AND status='planning'
+                """,
+                (time.time(), redact_text(error, limit=2000), address_id),
+            )
+            return bool(cur.rowcount)
+
+    def crawl_address_tasks(self, address_id: str) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT t.*, cat.sequence_no FROM crawl_address_tasks cat
+                JOIN tasks t ON t.id=cat.task_id
+                WHERE cat.address_id=? ORDER BY cat.sequence_no
+                """,
+                (address_id,),
+            ).fetchall()
+            return [self._task(row) | {"sequence_no": row["sequence_no"]} for row in rows]  # type: ignore[operator]
+
+    def list_crawl_tasks(
+        self,
+        batch_id: str,
+        *,
+        address_id: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        where = "ca.batch_id=?"
+        params: list[Any] = [batch_id]
+        if address_id:
+            where += " AND ca.id=?"
+            params.append(address_id)
+        params.extend([max(1, min(int(limit), 1000)), max(0, int(offset))])
+        with self._lock:
+            rows = self._conn.execute(
+                f"""
+                SELECT t.*, ca.id AS crawl_address_id, ca.source_order, ca.address_order,
+                    cat.sequence_no
+                FROM crawl_address_tasks cat
+                JOIN crawl_addresses ca ON ca.id=cat.address_id
+                JOIN tasks t ON t.id=cat.task_id
+                WHERE {where}
+                ORDER BY ca.source_order, ca.address_order, cat.sequence_no
+                LIMIT ? OFFSET ?
+                """,
+                params,
+            ).fetchall()
+            result: list[dict[str, Any]] = []
+            for row in rows:
+                task = self._task(row)
+                if task is not None:
+                    task["crawl_address_id"] = row["crawl_address_id"]
+                    task["source_order"] = row["source_order"]
+                    task["address_order"] = row["address_order"]
+                    task["sequence_no"] = row["sequence_no"]
+                    result.append(task)
+            return result
+
+    def crawl_batch_task_count(self, batch_id: str) -> int:
+        with self._lock:
+            return int(
+                self._conn.execute(
+                    """
+                    SELECT COUNT(*) FROM crawl_address_tasks cat
+                    JOIN crawl_addresses ca ON ca.id=cat.address_id
+                    WHERE ca.batch_id=?
+                    """,
+                    (batch_id,),
+                ).fetchone()[0]
+            )
+
+    @staticmethod
+    def _refresh_crawl_batch_counts(conn: sqlite3.Connection, batch_id: str) -> None:
+        counts = conn.execute(
+            """
+            SELECT COUNT(*) AS total,
+                SUM(CASE WHEN t.status='succeeded' THEN 1 ELSE 0 END) AS succeeded,
+                SUM(CASE WHEN t.status='failed' THEN 1 ELSE 0 END) AS failed,
+                SUM(CASE WHEN t.status='cancelled' THEN 1 ELSE 0 END) AS cancelled
+            FROM crawl_address_tasks cat
+            JOIN crawl_addresses ca ON ca.id=cat.address_id
+            JOIN tasks t ON t.id=cat.task_id
+            WHERE ca.batch_id=?
+            """,
+            (batch_id,),
+        ).fetchone()
+        conn.execute(
+            """
+            UPDATE crawl_batches SET task_count=?, succeeded_task_count=?,
+                failed_task_count=?, cancelled_task_count=?, updated_at=? WHERE id=?
+            """,
+            (
+                int(counts["total"] or 0),
+                int(counts["succeeded"] or 0),
+                int(counts["failed"] or 0),
+                int(counts["cancelled"] or 0),
+                time.time(),
+                batch_id,
+            ),
+        )
+
+    def finish_crawl_address_if_terminal(self, address_id: str) -> bool:
+        terminal = {"succeeded", "failed", "cancelled"}
+        now = time.time()
+        with self._transaction() as conn:
+            address = conn.execute(
+                "SELECT * FROM crawl_addresses WHERE id=?",
+                (address_id,),
+            ).fetchone()
+            if address is None or address["status"] != "running":
+                return False
+            rows = conn.execute(
+                """
+                SELECT t.status FROM crawl_address_tasks cat
+                JOIN tasks t ON t.id=cat.task_id WHERE cat.address_id=?
+                """,
+                (address_id,),
+            ).fetchall()
+            statuses = [str(row["status"]) for row in rows]
+            if not statuses or any(status not in terminal for status in statuses):
+                return False
+            batch = conn.execute(
+                "SELECT cancel_requested FROM crawl_batches WHERE id=?",
+                (address["batch_id"],),
+            ).fetchone()
+            succeeded = statuses.count("succeeded")
+            failed = statuses.count("failed")
+            cancelled = statuses.count("cancelled")
+            planning_error = str(address["last_error"] or "")
+            status = "cancelled" if batch and batch["cancel_requested"] else "succeeded"
+            if status != "cancelled" and (failed or cancelled or planning_error):
+                status = "failed"
+            error = (
+                ""
+                if status == "succeeded"
+                else planning_error or f"媒体任务失败={failed}, 取消={cancelled}"
+            )
+            conn.execute(
+                """
+                UPDATE crawl_addresses SET status=?, succeeded_task_count=?,
+                    failed_task_count=?, cancelled_task_count=?, finished_at=?,
+                    updated_at=?, last_error=? WHERE id=?
+                """,
+                (status, succeeded, failed, cancelled, now, now, error, address_id),
+            )
+            self._refresh_crawl_batch_counts(conn, str(address["batch_id"]))
+            return True
+
+    def fail_crawl_address(self, address_id: str, error: str) -> None:
+        now = time.time()
+        with self._transaction() as conn:
+            row = conn.execute(
+                "SELECT batch_id FROM crawl_addresses WHERE id=?",
+                (address_id,),
+            ).fetchone()
+            if row is None:
+                return
+            conn.execute(
+                """
+                UPDATE crawl_addresses SET status='failed', finished_at=?, updated_at=?,
+                    last_error=? WHERE id=? AND status NOT IN ('succeeded','failed','cancelled')
+                """,
+                (now, now, redact_text(error, limit=2000), address_id),
+            )
+            conn.execute(
+                "UPDATE crawl_batches SET last_error=?, updated_at=? WHERE id=?",
+                (redact_text(error, limit=2000), now, row["batch_id"]),
+            )
+            self._refresh_crawl_batch_counts(conn, str(row["batch_id"]))
+
+    def finish_crawl_batch_if_ready(self, batch_id: str) -> bool:
+        now = time.time()
+        with self._transaction() as conn:
+            batch = conn.execute(
+                "SELECT * FROM crawl_batches WHERE id=?",
+                (batch_id,),
+            ).fetchone()
+            if batch is None:
+                return False
+            rows = conn.execute(
+                "SELECT status FROM crawl_addresses WHERE batch_id=?",
+                (batch_id,),
+            ).fetchall()
+            statuses = [str(row["status"]) for row in rows]
+            terminal = {"succeeded", "failed", "cancelled"}
+            self._refresh_crawl_batch_counts(conn, batch_id)
+            if not statuses or any(status not in terminal for status in statuses):
+                next_status = "cancelling" if batch["cancel_requested"] else "running"
+                conn.execute(
+                    "UPDATE crawl_batches SET status=?, updated_at=? WHERE id=?",
+                    (next_status, now, batch_id),
+                )
+                return False
+            if batch["cancel_requested"]:
+                status = "cancelled"
+            elif any(status in {"failed", "cancelled"} for status in statuses):
+                status = "completed_with_errors"
+            else:
+                status = "succeeded"
+            conn.execute(
+                """
+                UPDATE crawl_batches SET status=?, finished_at=?, updated_at=? WHERE id=?
+                """,
+                (status, now, now, batch_id),
+            )
+            return True
+
+    def request_cancel_crawl_batch(self, batch_id: str) -> tuple[dict[str, Any] | None, list[str]]:
+        now = time.time()
+        with self._transaction() as conn:
+            batch = conn.execute(
+                "SELECT * FROM crawl_batches WHERE id=?",
+                (batch_id,),
+            ).fetchone()
+            if batch is None:
+                return None, []
+            if batch["status"] in {"succeeded", "completed_with_errors", "cancelled"}:
+                return self._crawl_batch(batch), []  # type: ignore[return-value]
+            conn.execute(
+                """
+                UPDATE crawl_batches SET status='cancelling', cancel_requested=1,
+                    updated_at=? WHERE id=?
+                """,
+                (now, batch_id),
+            )
+            conn.execute(
+                """
+                UPDATE crawl_addresses SET status='cancelled', finished_at=?, updated_at=?,
+                    last_error='批次已取消'
+                WHERE batch_id=? AND status IN ('pending','planning')
+                """,
+                (now, now, batch_id),
+            )
+            task_rows = conn.execute(
+                """
+                SELECT t.id FROM crawl_address_tasks cat
+                JOIN crawl_addresses ca ON ca.id=cat.address_id
+                JOIN tasks t ON t.id=cat.task_id
+                WHERE ca.batch_id=? AND t.status NOT IN ('succeeded','failed','cancelled')
+                """,
+                (batch_id,),
+            ).fetchall()
+            return self._crawl_batch(
+                conn.execute("SELECT * FROM crawl_batches WHERE id=?", (batch_id,)).fetchone()
+            ), [str(row["id"]) for row in task_rows]  # type: ignore[return-value]
+
+    def recover_ordered_crawls(self) -> int:
+        now = time.time()
+        with self._transaction() as conn:
+            linked = conn.execute(
+                """
+                UPDATE crawl_addresses SET status='running', updated_at=?,
+                    planned_task_count=(
+                        SELECT COUNT(*) FROM crawl_address_tasks cat
+                        WHERE cat.address_id=crawl_addresses.id
+                    ),
+                    last_error='后端重启时地址只完成了部分规划，等待已创建任务结束'
+                WHERE status='planning' AND EXISTS (
+                    SELECT 1 FROM crawl_address_tasks cat
+                    WHERE cat.address_id=crawl_addresses.id
+                )
+                """,
+                (now,),
+            )
+            pending = conn.execute(
+                """
+                UPDATE crawl_addresses SET status='pending', updated_at=?, last_error='后端重启后重新规划'
+                WHERE status='planning' AND NOT EXISTS (
+                    SELECT 1 FROM crawl_address_tasks cat
+                    WHERE cat.address_id=crawl_addresses.id
+                )
+                """,
+                (now,),
+            )
+            conn.execute(
+                """
+                UPDATE crawl_batches SET status=CASE WHEN cancel_requested=1 THEN 'cancelling' ELSE 'running' END,
+                    updated_at=? WHERE status IN ('queued','running','cancelling')
+                """,
+                (now,),
+            )
+            return int(linked.rowcount) + int(pending.rowcount)
 
     def put_site_policy(self, site: str, policy: dict[str, Any]) -> dict[str, Any]:
         now = time.time()

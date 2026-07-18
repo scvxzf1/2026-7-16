@@ -19,8 +19,10 @@ class FakeGallery:
     def __init__(self, results: list[GalleryRunResult]):
         self.results = list(results)
         self.cancelled: list[str] = []
+        self.calls: list[dict] = []
 
     async def run(self, task_id: str, **kwargs):
+        self.calls.append({"task_id": task_id, **kwargs})
         await kwargs["on_started"](100 + len(self.results), f"marker-{task_id}")
         result = self.results.pop(0)
         if result.output_tail:
@@ -126,6 +128,31 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(task["status"], "succeeded")
         self.assertTrue(self.db.get_logs("task-1"))
 
+    async def test_prefer_uses_proxy_when_a_node_is_available(self):
+        self.db.create_task(values(self.root, proxy_mode="prefer", attempts=1))
+        gallery = FakeGallery([GalleryRunResult(0, "saved file", False, "m", 101)])
+        proxy = FakeProxy(with_nodes=True)
+        scheduler = TaskScheduler(self.db, gallery, proxy, self.settings.scheduler)
+        await scheduler.start()
+        task = await self.wait_terminal("task-1")
+        await scheduler.stop()
+        self.assertEqual(task["status"], "succeeded")
+        self.assertEqual(gallery.calls[0]["proxy_url"], "http://127.0.0.1:28001")
+        self.assertEqual(proxy.releases, [("task-1", False)])
+
+    async def test_prefer_falls_back_to_direct_when_pool_is_empty(self):
+        self.db.create_task(values(self.root, proxy_mode="prefer", attempts=1))
+        gallery = FakeGallery([GalleryRunResult(0, "saved file", False, "m", 101)])
+        scheduler = TaskScheduler(self.db, gallery, FakeProxy(), self.settings.scheduler)
+        await scheduler.start()
+        task = await self.wait_terminal("task-1")
+        await scheduler.stop()
+        self.assertEqual(task["status"], "succeeded")
+        self.assertIsNone(gallery.calls[0]["proxy_url"])
+        self.assertTrue(
+            any("本次任务使用直连" in row["line"] for row in self.db.get_logs("task-1"))
+        )
+
     async def test_proxy_failure_switches_node_then_succeeds(self):
         self.db.create_task(values(self.root, proxy_mode="required", attempts=2))
         gallery = FakeGallery(
@@ -178,6 +205,61 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
         serialized = str(task) + str(self.db.get_logs("task-1"))
         self.assertNotIn("proxy-user", serialized)
         self.assertNotIn("proxy-secret", serialized)
+
+    async def test_invalid_managed_login_pauses_queue_until_reauthorized(self):
+        task_values = values(self.root, proxy_mode="direct", attempts=1)
+        task_values.update({"site": "twitter", "cookies_file": str(self.root / "twitter.cookies.txt")})
+        self.db.create_task(task_values)
+        gallery = FakeGallery([GalleryRunResult(0, "done", False, "m", 101)])
+        available = False
+
+        def validate(_site, _cookies_file):
+            return available
+
+        scheduler = TaskScheduler(
+            self.db,
+            gallery,
+            FakeProxy(),
+            self.settings.scheduler,
+            credential_validator=validate,
+        )
+        await scheduler.start()
+        await asyncio.sleep(0.15)
+        self.assertEqual(self.db.get_task("task-1")["status"], "queued")
+        self.assertFalse(gallery.calls)
+        available = True
+        task = await self.wait_terminal("task-1")
+        await scheduler.stop()
+        self.assertEqual(task["status"], "succeeded")
+
+    async def test_authentication_failure_notifies_managed_auth_callback(self):
+        task_values = values(self.root, proxy_mode="direct", attempts=1)
+        cookie_file = str(self.root / "twitter.cookies.txt")
+        task_values.update({"site": "twitter", "cookies_file": cookie_file})
+        self.db.create_task(task_values)
+        gallery = FakeGallery(
+            [GalleryRunResult(1, "authenticated cookies needed to access this timeline", False, "m", 101)]
+        )
+        calls = []
+
+        async def invalidate(site, cookies, message):
+            calls.append((site, cookies, message))
+            return True
+
+        scheduler = TaskScheduler(
+            self.db,
+            gallery,
+            FakeProxy(),
+            self.settings.scheduler,
+            auth_failure_callback=invalidate,
+        )
+        await scheduler.start()
+        task = await self.wait_terminal("task-1")
+        await scheduler.stop()
+        self.assertEqual(task["last_error_class"], "authentication")
+        self.assertEqual(calls[0][:2], ("twitter", cookie_file))
+        self.assertIn("authenticated cookies needed", calls[0][2])
+        self.assertTrue(any("等待重新授权" in row["line"] for row in self.db.get_logs("task-1")))
 
 
 if __name__ == "__main__":

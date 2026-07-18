@@ -48,6 +48,15 @@ class ClassifierTests(unittest.TestCase):
         self.assertTrue(result.retryable)
         self.assertTrue(result.proxy_fault)
 
+    def test_cloudflare_challenge_rotates_proxy_node(self):
+        result = classify_result(
+            4,
+            "Cloudflare challenge (403 Forbidden) for 'https://x.com/account/access'",
+        )
+        self.assertEqual(result.error_class, "proxy_failure")
+        self.assertTrue(result.retryable)
+        self.assertTrue(result.proxy_fault)
+
     def test_public_gallery_access_denial_rotates_proxy_node(self):
         result = classify_result(
             16,

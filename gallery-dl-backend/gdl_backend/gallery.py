@@ -29,6 +29,20 @@ class GalleryRunResult:
     pid: int
 
 
+@dataclass(slots=True)
+class GalleryCaptureResult:
+    exit_code: int | None
+    stdout: str
+    stderr: str
+    timed_out: bool
+    marker: str
+    pid: int
+
+
+class _CaptureLimitExceeded(RuntimeError):
+    pass
+
+
 class GalleryRunner:
     def __init__(self, settings: GallerySettings, backend_root: Path) -> None:
         self.settings = settings
@@ -66,7 +80,11 @@ class GalleryRunner:
             return "", ""
         key = re.sub(r"[^A-Za-z0-9]", "_", credentials_ref).upper()
         prefix = f"GDL_CREDENTIAL_{key}_"
-        return os.environ.get(prefix + "USERNAME", ""), os.environ.get(prefix + "PASSWORD", "")
+        username = os.environ.get(prefix + "USERNAME", "")
+        password = os.environ.get(prefix + "PASSWORD", "")
+        if not username and not password:
+            raise ValueError(f"credentials_ref 未配置对应环境变量: {credentials_ref}")
+        return username, password
 
     def build_command(
         self,
@@ -91,6 +109,8 @@ class GalleryRunner:
             str(self.settings.repo_path),
             "--",
             "--config-ignore",
+            "--cache-file",
+            str(self.settings.cache_file),
             "--no-colors",
             "--no-input",
             "--destination",
@@ -211,6 +231,133 @@ class GalleryRunner:
                 if current and current[0] is process:
                     self._active.pop(task_id, None)
         return GalleryRunResult(process.returncode, "\n".join(tail), timed_out, marker, process.pid)
+
+    async def capture(
+        self,
+        operation_id: str,
+        *,
+        url: str,
+        output_dir: str,
+        proxy_url: str | None,
+        http_timeout: float,
+        gallery_retries: int,
+        task_timeout: float,
+        cookies_file: str | None,
+        config_file: str | None,
+        credentials_ref: str | None,
+        extra_args: list[str],
+        max_output_bytes: int = 64 * 1024 * 1024,
+    ) -> GalleryCaptureResult:
+        """Run a metadata-only gallery-dl job and return its complete protocol output."""
+        if not (self.settings.repo_path / "gallery_dl" / "__init__.py").is_file():
+            raise FileNotFoundError(f"gallery-dl 源码目录无效: {self.settings.repo_path}")
+        Path(output_dir).mkdir(parents=True, exist_ok=True)
+        marker = f"{operation_id}-{uuid.uuid4().hex}"
+        command = self.build_command(
+            marker=marker,
+            url=url,
+            output_dir=output_dir,
+            proxy_url=proxy_url,
+            http_timeout=http_timeout,
+            gallery_retries=gallery_retries,
+            cookies_file=cookies_file,
+            config_file=config_file,
+            extra_args=extra_args,
+        )
+        env = os.environ.copy()
+        env["PYTHONUNBUFFERED"] = "1"
+        env["PYTHONIOENCODING"] = "utf-8"
+        pythonpath = [str(self.backend_root), str(self.settings.repo_path)]
+        if env.get("PYTHONPATH"):
+            pythonpath.append(env["PYTHONPATH"])
+        env["PYTHONPATH"] = os.pathsep.join(pythonpath)
+        username, password = self._credentials(credentials_ref)
+        if username:
+            env["GDL_WORKER_USERNAME"] = username
+        if password:
+            env["GDL_WORKER_PASSWORD"] = password
+
+        kwargs: dict[str, object] = {
+            "cwd": str(self.settings.repo_path),
+            "env": env,
+            "stdout": asyncio.subprocess.PIPE,
+            "stderr": asyncio.subprocess.PIPE,
+        }
+        if os.name == "nt":
+            kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            kwargs["start_new_session"] = True
+        process = await asyncio.create_subprocess_exec(*command, **kwargs)
+        async with self._lock:
+            self._active[operation_id] = (process, marker)
+
+        captured_bytes = 0
+
+        async def read_limited(stream: asyncio.StreamReader | None) -> bytes:
+            nonlocal captured_bytes
+            if stream is None:
+                return b""
+            chunks: list[bytes] = []
+            while True:
+                chunk = await stream.read(64 * 1024)
+                if not chunk:
+                    return b"".join(chunks)
+                captured_bytes += len(chunk)
+                if captured_bytes > max_output_bytes:
+                    raise _CaptureLimitExceeded
+                chunks.append(chunk)
+
+        readers = [
+            asyncio.create_task(read_limited(process.stdout)),
+            asyncio.create_task(read_limited(process.stderr)),
+        ]
+        waiter = asyncio.create_task(process.wait())
+        group = asyncio.gather(waiter, *readers)
+        timed_out = False
+        try:
+            if task_timeout and task_timeout > 0:
+                try:
+                    _, stdout_raw, stderr_raw = await asyncio.wait_for(
+                        asyncio.shield(group),
+                        timeout=task_timeout,
+                    )
+                except asyncio.TimeoutError:
+                    timed_out = True
+                    await terminate_process(process, self.settings.terminate_grace_seconds)
+                    _, stdout_raw, stderr_raw = await group
+            else:
+                _, stdout_raw, stderr_raw = await group
+        except _CaptureLimitExceeded as exc:
+            await terminate_process(process, self.settings.terminate_grace_seconds)
+            await asyncio.gather(waiter, *readers, return_exceptions=True)
+            raise ValueError(f"gallery-dl 元数据输出超过 {max_output_bytes} 字节上限") from exc
+        except asyncio.CancelledError:
+            await terminate_process(process, self.settings.terminate_grace_seconds)
+            await asyncio.gather(waiter, *readers, return_exceptions=True)
+            raise
+        finally:
+            async with self._lock:
+                current = self._active.get(operation_id)
+                if current and current[0] is process:
+                    self._active.pop(operation_id, None)
+
+        stdout = stdout_raw.decode("utf-8", "replace")
+        for secret in (username, password):
+            if secret:
+                stdout = stdout.replace(secret, "***")
+        stderr = redact_text(
+            stderr_raw.decode("utf-8", "replace"),
+            secrets=(username, password),
+            limit=max_output_bytes,
+        )
+        return GalleryCaptureResult(
+            process.returncode,
+            stdout,
+            stderr,
+            timed_out,
+            marker,
+            process.pid,
+        )
 
     async def cancel(self, task_id: str) -> bool:
         async with self._lock:

@@ -1,0 +1,333 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>聚合爬取测试台</title>
+  <link rel="stylesheet" href="./styles.css">
+  <script src="./app.js" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand-block">
+      <span class="brand-mark" aria-hidden="true">G</span>
+      <div>
+        <h1>聚合爬取测试台</h1>
+        <p>搜索画师来源 → 选择并排序图库 → 单地址图片并发</p>
+      </div>
+    </div>
+    <div class="top-actions">
+      <span id="apiStatus" class="status-pill neutral"><span class="status-dot"></span>API 待检测</span>
+      <span id="proxyStatusPill" class="status-pill neutral"><span class="status-dot"></span>代理池待检测</span>
+      <a class="button ghost compact" href="/docs" target="_blank" rel="noreferrer">Swagger</a>
+    </div>
+  </header>
+
+  <main class="page-shell">
+    <section class="panel connection-panel" aria-labelledby="connectionTitle">
+      <div class="panel-heading">
+        <div>
+          <p class="eyebrow">连接</p>
+          <h2 id="connectionTitle">后端与代理池</h2>
+        </div>
+        <button id="checkConnection" class="button secondary" type="button">检测连接</button>
+      </div>
+
+      <div class="connection-grid">
+        <label class="field grow">
+          <span>API Key</span>
+          <input id="apiKey" type="password" autocomplete="off" placeholder="未配置时留空">
+          <small>仅保存到当前标签页的 sessionStorage。</small>
+        </label>
+        <div class="proxy-summary" id="proxySummary">
+          <div><span>运行</span><strong>—</strong></div>
+          <div><span>节点</span><strong>—</strong></div>
+          <div><span>健康</span><strong>—</strong></div>
+          <div><span>租约</span><strong>—</strong></div>
+          <div><span>传输核心</span><strong>—</strong></div>
+        </div>
+      </div>
+
+      <div class="button-row">
+        <button id="proxyStart" class="button primary" type="button">启动代理池</button>
+        <button id="proxyReload" class="button secondary" type="button">重载节点</button>
+        <button id="proxyProbe" class="button secondary" type="button">全池探活</button>
+        <button id="proxyStop" class="button danger-quiet" type="button">停止代理池</button>
+      </div>
+      <p id="proxyError" class="inline-error hidden" role="alert"></p>
+    </section>
+
+    <section class="panel" aria-labelledby="searchTitle">
+      <div class="panel-heading">
+        <div>
+          <p class="eyebrow">第一步</p>
+          <h2 id="searchTitle">聚合关键词搜索</h2>
+          <p class="muted">搜索阶段只返回账号、标签或具体画廊，不会下载图片。</p>
+        </div>
+      </div>
+
+      <form id="searchForm">
+        <div class="search-grid">
+          <label class="field keyword-field">
+            <span>画师 / 角色 / 作品关键词</span>
+            <input id="keyword" type="search" required maxlength="1000" placeholder="例如：clover days">
+          </label>
+          <label class="field small-field">
+            <span>证据上限</span>
+            <input id="searchLimit" type="number" min="1" max="200" value="20">
+          </label>
+          <label class="field small-field">
+            <span>搜索路由</span>
+            <select id="searchProxyMode">
+              <option value="required" selected>必须使用代理池</option>
+              <option value="prefer">优先代理池</option>
+              <option value="direct">直连</option>
+            </select>
+          </label>
+        </div>
+
+        <fieldset class="site-picker">
+          <legend>搜索来源（结果按此顺序）</legend>
+          <label><input type="checkbox" name="site" value="danbooru" checked><span>Danbooru</span></label>
+          <label><input type="checkbox" name="site" value="twitter" checked><span>X / Twitter</span></label>
+          <label><input type="checkbox" name="site" value="pixiv" checked><span>Pixiv</span></label>
+          <label><input type="checkbox" name="site" value="exhentai" checked><span>EH</span></label>
+        </fieldset>
+
+        <section id="authCenter" class="auth-center" aria-labelledby="authCenterTitle">
+          <div class="auth-center-heading">
+            <div>
+              <p class="eyebrow">自动凭证</p>
+              <h3 id="authCenterTitle">站点登录授权</h3>
+              <p class="muted">X 与 EH 使用项目专属 Chrome 登录窗口；登录一次后持久化复用，实际失效时再提示重新授权。</p>
+            </div>
+            <div class="auth-toolbar">
+              <button id="refreshAuth" class="button ghost compact" type="button">刷新授权状态</button>
+            </div>
+          </div>
+
+          <div id="authCards" class="auth-grid" aria-live="polite">
+            <article class="auth-card" data-auth-card="danbooru">
+              <div class="auth-card-title"><strong>Danbooru</strong><span class="auth-state">检测中</span></div>
+              <p class="auth-summary muted">读取公开 API 状态…</p>
+              <div class="auth-actions"></div>
+            </article>
+            <article class="auth-card" data-auth-card="twitter">
+              <div class="auth-card-title"><strong>X / Twitter</strong><span class="auth-state">检测中</span></div>
+              <p class="auth-summary muted">检测项目专属浏览器登录状态…</p>
+              <p class="auth-feedback hidden" aria-live="polite"></p>
+              <div class="auth-actions">
+                <button class="button secondary compact" data-managed-browser-auth="twitter" type="button">打开专属登录窗口</button>
+                <button class="button ghost compact hidden" data-managed-browser-cancel="twitter" type="button">关闭登录窗口</button>
+                <button class="button danger-quiet compact hidden" data-auth-clear="twitter" type="button">退出托管登录</button>
+              </div>
+            </article>
+            <article class="auth-card" data-auth-card="pixiv">
+              <div class="auth-card-title"><strong>Pixiv</strong><span class="auth-state">检测中</span></div>
+              <p class="auth-summary muted">检测 OAuth 登录授权…</p>
+              <div class="auth-actions">
+                <button id="startPixivOAuth" class="button primary compact" type="button">Pixiv 登录授权</button>
+                <button class="button danger-quiet compact hidden" data-auth-clear="pixiv" type="button">退出托管登录</button>
+              </div>
+            </article>
+            <article class="auth-card" data-auth-card="exhentai">
+              <div class="auth-card-title"><strong>EH</strong><span class="auth-state">检测中</span></div>
+              <p class="auth-summary muted">检测项目专属浏览器登录状态…</p>
+              <p class="auth-feedback hidden" aria-live="polite"></p>
+              <div class="auth-actions">
+                <button class="button secondary compact" data-managed-browser-auth="exhentai" type="button">打开专属登录窗口</button>
+                <button class="button ghost compact hidden" data-managed-browser-cancel="exhentai" type="button">关闭登录窗口</button>
+                <button class="button danger-quiet compact hidden" data-auth-clear="exhentai" type="button">退出托管登录</button>
+              </div>
+            </article>
+          </div>
+
+          <div id="pixivOAuthPanel" class="oauth-panel hidden" aria-labelledby="pixivOAuthTitle">
+            <h4 id="pixivOAuthTitle">完成 Pixiv 登录授权</h4>
+            <ol>
+              <li>打开登录页并完成 Pixiv 登录。</li>
+              <li>在浏览器开发者工具的 Network 中选择最后一个 <code>callback?state=…</code> 请求。</li>
+              <li>复制该请求 URL，粘贴到下方后确认；Token 会由后端保存。</li>
+            </ol>
+            <div class="oauth-controls">
+              <a id="pixivAuthorizationLink" class="button primary" target="_blank" rel="noreferrer">打开 Pixiv 登录页</a>
+              <label class="field grow">
+                <span>授权回调 URL</span>
+                <input id="pixivOAuthCallback" type="text" autocomplete="off" placeholder="粘贴 callback URL 或 code">
+              </label>
+              <button id="completePixivOAuth" class="button success" type="button">确认授权</button>
+              <button id="cancelPixivOAuth" class="button ghost" type="button">取消</button>
+            </div>
+          </div>
+        </section>
+
+        <details class="advanced-block">
+          <summary>来源路由覆盖</summary>
+          <p class="muted compact-copy">只在某个来源需要不同代理策略时设置；空值继承上方搜索路由。</p>
+          <div class="source-config-table routing-only">
+            <div class="source-config-head"><span>来源</span><span>路由覆盖</span></div>
+            <div class="source-config-row" data-source-config="danbooru"><strong>Danbooru</strong><select name="source_route_danbooru" aria-label="Danbooru 路由覆盖" data-field="proxy_mode"><option value="">继承</option><option value="required">必须代理</option><option value="prefer">优先代理</option><option value="direct">直连</option></select></div>
+            <div class="source-config-row" data-source-config="twitter"><strong>X</strong><select name="source_route_twitter" aria-label="X 路由覆盖" data-field="proxy_mode"><option value="">继承</option><option value="required">必须代理</option><option value="prefer">优先代理</option><option value="direct">直连</option></select></div>
+            <div class="source-config-row" data-source-config="pixiv"><strong>Pixiv</strong><select name="source_route_pixiv" aria-label="Pixiv 路由覆盖" data-field="proxy_mode"><option value="">继承</option><option value="required">必须代理</option><option value="prefer">优先代理</option><option value="direct">直连</option></select></div>
+            <div class="source-config-row" data-source-config="exhentai"><strong>EH</strong><select name="source_route_exhentai" aria-label="EH 路由覆盖" data-field="proxy_mode"><option value="">继承</option><option value="required">必须代理</option><option value="prefer">优先代理</option><option value="direct">直连</option></select></div>
+          </div>
+        </details>
+
+        <div class="form-footer">
+          <p id="searchHint" class="muted">选择来源后开始搜索。</p>
+          <button id="searchButton" class="button primary prominent" type="submit">搜索候选图库</button>
+        </div>
+      </form>
+    </section>
+
+    <section id="resultsPanel" class="panel hidden" aria-labelledby="resultsTitle">
+      <div class="panel-heading wrap-heading">
+        <div>
+          <p class="eyebrow">第二步</p>
+          <h2 id="resultsTitle">选择来源和图库地址</h2>
+          <p id="searchSummary" class="muted"></p>
+        </div>
+        <div class="button-row compact-row">
+          <label class="toggle weak-toggle"><input id="showWeakEvidence" type="checkbox"><span>显示弱证据</span></label>
+          <button id="selectAll" class="button secondary" type="button">全选当前显示</button>
+          <button id="clearSelection" class="button ghost" type="button">清空选择</button>
+        </div>
+      </div>
+
+      <div class="order-note">
+        <strong>执行规则：</strong>来源从上到下；来源内地址从上到下；当前地址里的图片并发。
+        使用 ↑ ↓ 调整提交顺序。
+      </div>
+      <section id="ehTagFilter" class="eh-tag-filter hidden" aria-labelledby="ehTagFilterTitle">
+        <div class="eh-tag-filter-heading">
+          <div>
+            <p class="eyebrow">EH 候选过滤</p>
+            <h3 id="ehTagFilterTitle">按官方标签命名空间筛选</h3>
+            <p id="ehTagFilterHint" class="muted" aria-live="polite"></p>
+          </div>
+          <div class="eh-tag-filter-controls">
+            <label class="field compact-field">
+              <span>查找标签</span>
+              <input id="ehTagQuery" type="search" placeholder="例如 artist、language、chinese">
+            </label>
+            <button id="clearEhTagFilters" class="button ghost" type="button">清空标签筛选</button>
+          </div>
+        </div>
+        <div class="eh-tag-filter-legend">
+          <span><i class="tag-state include" aria-hidden="true"></i>包含</span>
+          <span><i class="tag-state exclude" aria-hidden="true"></i>排除</span>
+          <span>点击标签依次切换：包含 → 排除 → 清除</span>
+          <a href="https://ehwiki.org/wiki/Namespace" target="_blank" rel="noreferrer">EHWiki 命名空间标准</a>
+        </div>
+        <div id="ehTagGroups" class="eh-tag-groups"></div>
+      </section>
+      <div id="sourceResults" class="source-results"></div>
+      <div id="relatedProfiles"></div>
+
+      <details class="raw-block">
+        <summary>查看搜索原始响应</summary>
+        <pre id="rawSearchResponse"></pre>
+      </details>
+
+      <div class="crawl-submit-box">
+        <div class="panel-heading compact-heading">
+          <div>
+            <p class="eyebrow">第三步</p>
+            <h3>提交顺序批次</h3>
+          </div>
+          <strong id="selectionCount" class="selection-count">已选 0 个地址</strong>
+        </div>
+        <div class="crawl-config-grid">
+          <label class="field">
+            <span>单地址图片并发</span>
+            <input id="crawlConcurrency" type="number" min="1" max="128" value="20">
+          </label>
+          <label class="field">
+            <span>批次任务保护上限</span>
+            <input id="maxTasks" type="number" min="1" max="100000" value="10000">
+          </label>
+          <label class="field">
+            <span>下载路由</span>
+            <select id="crawlProxyMode">
+              <option value="required" selected>必须使用代理池</option>
+              <option value="prefer">优先代理池</option>
+              <option value="direct">直连</option>
+            </select>
+          </label>
+          <label class="field output-field">
+            <span>输出目录（可选）</span>
+            <input id="outputDir" type="text" placeholder="相对默认下载目录，或许可的绝对路径">
+          </label>
+        </div>
+        <div class="form-footer">
+          <p id="crawlHint" class="muted">先勾选至少一个图库地址。</p>
+          <button id="startCrawl" class="button success prominent" type="button" disabled>按当前顺序开始爬取</button>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel" aria-labelledby="batchTitle">
+      <div class="panel-heading wrap-heading">
+        <div>
+          <p class="eyebrow">运行监控</p>
+          <h2 id="batchTitle">顺序批次</h2>
+          <p class="muted">查看当前地址、来源顺序、图片任务及代理并发执行结果。</p>
+        </div>
+        <div class="button-row compact-row">
+          <button id="refreshBatch" class="button secondary" type="button">刷新</button>
+          <button id="cancelBatch" class="button danger-quiet" type="button" disabled>取消批次</button>
+        </div>
+      </div>
+
+      <div class="recent-row">
+        <label class="field grow">
+          <span>最近批次</span>
+          <select id="recentBatches"><option value="">暂无已加载批次</option></select>
+        </label>
+        <button id="loadBatch" class="button secondary align-end" type="button">载入</button>
+        <label class="toggle align-end"><input id="autoPoll" type="checkbox" checked><span>自动刷新</span></label>
+      </div>
+
+      <div id="emptyBatch" class="empty-state">
+        <strong>尚未选择批次</strong>
+        <span>提交爬取后会自动显示，或从最近批次中载入。</span>
+      </div>
+      <div id="batchView" class="hidden">
+        <div id="batchHeader" class="batch-header"></div>
+        <div class="progress-track" aria-label="任务进度"><span id="batchProgress"></span></div>
+        <div id="batchSources" class="batch-sources"></div>
+
+        <div class="task-heading">
+          <h3>图片任务</h3>
+          <span id="taskSummary" class="muted"></span>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>顺序</th><th>来源</th><th>状态</th><th>尝试</th><th>地址</th></tr></thead>
+            <tbody id="taskRows"></tbody>
+          </table>
+        </div>
+
+        <details class="raw-block">
+          <summary>查看批次原始响应</summary>
+          <pre id="rawBatchResponse"></pre>
+        </details>
+      </div>
+    </section>
+
+    <section class="panel log-panel" aria-labelledby="logTitle">
+      <div class="panel-heading compact-heading">
+        <div><p class="eyebrow">调试</p><h2 id="logTitle">界面事件</h2></div>
+        <button id="clearLog" class="button ghost compact" type="button">清空</button>
+      </div>
+      <ol id="eventLog" class="event-log" aria-live="polite"></ol>
+    </section>
+  </main>
+
+  <footer>
+    <span>gallery-dl Backend · 单一工作流测试界面</span>
+    <a href="/" target="_blank" rel="noreferrer">服务信息</a>
+  </footer>
+</body>
+</html>

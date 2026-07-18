@@ -20,11 +20,18 @@
   },
   "gallery": {
     "repo_path": "../gallery-dl-codeberg",
+    "cache_file": "credentials/managed/gallery-dl-cache.sqlite3",
     "python_executable": "",
+    "migrate_default_auth": true,
     "default_http_timeout": 30,
     "default_retries": 2,
     "terminate_grace_seconds": 5,
     "max_log_line_chars": 4000
+  },
+  "auth": {
+    "chrome_executable": "",
+    "browser_login_timeout_seconds": 900,
+    "browser_poll_interval_seconds": 1
   },
   "proxy": {
     "enabled": true,
@@ -48,14 +55,14 @@
     "transport_core_start_timeout_seconds": 15
   },
   "scheduler": {
-    "max_concurrent_tasks": 4,
+    "max_concurrent_tasks": 20,
     "poll_interval_seconds": 0.5,
     "shutdown_grace_seconds": 15,
     "max_logs_per_task": 5000,
     "retry_jitter_seconds": 0.5
   },
   "default_site_policy": {
-    "max_concurrency": 2,
+    "max_concurrency": 20,
     "retry_limit": 2,
     "backoff_base_seconds": 2,
     "proxy_mode": "prefer",

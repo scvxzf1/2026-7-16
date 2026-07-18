@@ -107,6 +107,153 @@ class DatabaseTests(unittest.TestCase):
         ).fetchone()
         self.assertIsNone(remaining)
 
+    def test_ordered_crawl_batch_persists_order_links_and_idempotency(self):
+        addresses = [
+            {
+                "id": "address-1",
+                "site": "twitter",
+                "source_order": 0,
+                "address_order": 0,
+                "url": "https://x.com/a/media",
+                "proxy_mode": "required",
+                "max_attempts": 3,
+            },
+            {
+                "id": "address-2",
+                "site": "pixiv",
+                "source_order": 1,
+                "address_order": 0,
+                "url": "https://www.pixiv.net/users/1/artworks",
+                "proxy_mode": "required",
+                "max_attempts": 3,
+            },
+        ]
+        batch_id, created = self.db.create_crawl_batch(
+            {
+                "id": "batch-1",
+                "output_dir": str(self.root / "batch"),
+                "concurrency": 20,
+                "max_tasks": 100,
+            },
+            addresses,
+            idempotency_key="same-batch",
+        )
+        self.assertTrue(created)
+        duplicate, created = self.db.create_crawl_batch(
+            {
+                "id": "batch-2",
+                "output_dir": str(self.root / "other"),
+                "concurrency": 1,
+                "max_tasks": 1,
+            },
+            addresses,
+            idempotency_key="same-batch",
+        )
+        self.assertFalse(created)
+        self.assertEqual(duplicate, batch_id)
+        self.assertEqual(self.db.next_crawl_address(batch_id)["id"], "address-1")
+        self.assertTrue(self.db.begin_crawl_address_planning("address-1"))
+
+        values = task_values(self.root)
+        self.db.create_task(values)
+        self.db.link_crawl_task("address-1", "task-1", 1)
+        self.assertTrue(self.db.mark_crawl_address_running("address-1"))
+        self.db.complete_task("task-1", "succeeded")
+        self.assertTrue(self.db.finish_crawl_address_if_terminal("address-1"))
+        self.assertEqual(self.db.next_crawl_address(batch_id)["id"], "address-2")
+        batch = self.db.get_crawl_batch(batch_id)
+        self.assertEqual(batch["task_count"], 1)
+        self.assertEqual(batch["succeeded_task_count"], 1)
+        self.assertEqual(batch["sources"][0]["status"], "succeeded")
+        self.assertEqual(batch["sources"][1]["status"], "pending")
+
+    def test_ordered_crawl_recovery_resets_only_planning_address(self):
+        self.db.create_crawl_batch(
+            {
+                "id": "batch-recovery",
+                "output_dir": str(self.root / "batch"),
+                "concurrency": 20,
+                "max_tasks": 100,
+            },
+            [
+                {
+                    "id": "address-recovery",
+                    "site": "danbooru",
+                    "source_order": 0,
+                    "address_order": 0,
+                    "url": "https://danbooru.donmai.us/posts?tags=a",
+                    "proxy_mode": "prefer",
+                    "max_attempts": 3,
+                }
+            ],
+        )
+        self.assertTrue(self.db.begin_crawl_address_planning("address-recovery"))
+        self.assertEqual(self.db.recover_ordered_crawls(), 1)
+        self.assertEqual(self.db.next_crawl_address("batch-recovery")["status"], "pending")
+
+    def test_ordered_crawl_recovery_drains_partially_linked_address(self):
+        self.db.create_crawl_batch(
+            {
+                "id": "batch-linked-recovery",
+                "output_dir": str(self.root / "batch"),
+                "concurrency": 20,
+                "max_tasks": 100,
+            },
+            [
+                {
+                    "id": "address-linked-recovery",
+                    "site": "twitter",
+                    "source_order": 0,
+                    "address_order": 0,
+                    "url": "https://x.com/artist/media",
+                    "proxy_mode": "prefer",
+                    "max_attempts": 3,
+                }
+            ],
+        )
+        self.assertTrue(self.db.begin_crawl_address_planning("address-linked-recovery"))
+        self.db.create_task(task_values(self.root))
+        self.db.link_crawl_task("address-linked-recovery", "task-1", 1)
+
+        self.assertEqual(self.db.recover_ordered_crawls(), 1)
+        address = self.db.next_crawl_address("batch-linked-recovery")
+        self.assertEqual(address["status"], "running")
+        self.assertEqual(address["planned_task_count"], 1)
+        self.assertIn("部分规划", address["last_error"])
+
+        self.db.complete_task("task-1", "succeeded")
+        self.assertTrue(self.db.finish_crawl_address_if_terminal(address["id"]))
+        batch = self.db.get_crawl_batch("batch-linked-recovery")
+        self.assertEqual(batch["sources"][0]["addresses"][0]["status"], "failed")
+
+    def test_schema_v1_reopen_creates_ordered_crawl_tables(self):
+        path = self.root / "legacy.sqlite3"
+        legacy = Database(path)
+        with legacy._transaction() as conn:
+            conn.execute("DROP TABLE crawl_address_tasks")
+            conn.execute("DROP TABLE crawl_addresses")
+            conn.execute("DROP TABLE crawl_batches")
+            conn.execute("UPDATE meta SET value='1' WHERE key='schema_version'")
+        legacy.close()
+
+        upgraded = Database(path)
+        try:
+            version = upgraded._conn.execute(
+                "SELECT value FROM meta WHERE key='schema_version'"
+            ).fetchone()[0]
+            tables = {
+                row[0]
+                for row in upgraded._conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+            }
+            self.assertEqual(version, "2")
+            self.assertTrue(
+                {"crawl_batches", "crawl_addresses", "crawl_address_tasks"}.issubset(tables)
+            )
+        finally:
+            upgraded.close()
+
 
 if __name__ == "__main__":
     unittest.main()

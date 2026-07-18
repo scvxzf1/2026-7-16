@@ -5,7 +5,7 @@ import random
 import time
 from collections import Counter
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from .classifier import FailureDecision, classify_result
 from .config import SchedulerSettings
@@ -24,11 +24,16 @@ class TaskScheduler:
         gallery: GalleryRunner,
         proxy: ProxyPoolAdapter,
         settings: SchedulerSettings,
+        *,
+        credential_validator: Callable[[str, str | None], bool] | None = None,
+        auth_failure_callback: Callable[[str, str | None, str], Awaitable[bool]] | None = None,
     ) -> None:
         self.db = database
         self.gallery = gallery
         self.proxy = proxy
         self.settings = settings
+        self.credential_validator = credential_validator
+        self.auth_failure_callback = auth_failure_callback
         self._loop_task: asyncio.Task | None = None
         self._active: dict[str, tuple[asyncio.Task, str]] = {}
         self._wake = asyncio.Event()
@@ -89,6 +94,11 @@ class TaskScheduler:
                             break
                         policy = self._policy(task)
                         site = task["site"]
+                        if self.credential_validator and not self.credential_validator(
+                            site,
+                            task.get("cookies_file"),
+                        ):
+                            continue
                         if active_sites[site] >= policy.max_concurrency:
                             continue
                         if not self.db.claim_task(task["id"]):
@@ -163,6 +173,7 @@ class TaskScheduler:
         exit_code: int | None = None
         task: dict[str, Any] | None = None
         policy: SitePolicy | None = None
+        auth_failure_context = ""
         try:
             attempt = self.db.begin_attempt(task_id)
             attempt_id = attempt["id"]
@@ -242,6 +253,7 @@ class TaskScheduler:
                 progress_stop.set()
                 await asyncio.gather(progress_task, return_exceptions=True)
             exit_code = result.exit_code
+            auth_failure_context = result.output_tail
             latest = self.db.get_task(task_id)
             cancelled = bool(latest and latest.get("cancel_requested"))
             if self._stopping and not cancelled:
@@ -278,6 +290,33 @@ class TaskScheduler:
             finally:
                 if attempt_id:
                     self.db.clear_lease(task_id, attempt_id)
+
+        if (
+            decision.error_class == "authentication"
+            and task is not None
+            and self.auth_failure_callback is not None
+        ):
+            try:
+                invalidated = await self.auth_failure_callback(
+                    task["site"],
+                    task.get("cookies_file"),
+                    auth_failure_context or decision.message,
+                )
+                if invalidated and attempt_id:
+                    self.db.append_log(
+                        task_id,
+                        attempt_id,
+                        "backend",
+                        "托管登录凭证已标记失效；后续排队任务等待重新授权。",
+                    )
+            except Exception as exc:
+                if attempt_id:
+                    self.db.append_log(
+                        task_id,
+                        attempt_id,
+                        "backend",
+                        f"更新托管授权状态失败：{redact_text(exc, limit=500)}",
+                    )
 
         if not attempt_id:
             current = self.db.get_task(task_id)
