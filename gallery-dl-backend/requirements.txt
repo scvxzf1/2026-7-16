@@ -1,0 +1,7 @@
+fastapi>=0.115
+uvicorn>=0.30
+pydantic>=2.8
+requests>=2.31
+PySocks>=1.7.1
+PyYAML>=6.0
+filelock>=3.13

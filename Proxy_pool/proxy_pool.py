@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """Manual proxy pool: normalize / validate / weighted rotate / cooldown.
 
-Cloned and adapted from GPT注册机-QQ-NB ProxyRotator, with grok-project
+Cloned and adapted from an earlier ProxyRotator implementation, with project
 integration points (host validation, shared stats path, display helpers).
 """
 

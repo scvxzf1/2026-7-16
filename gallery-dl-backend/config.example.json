@@ -1,0 +1,70 @@
+{
+  "runtime_dir": "runtime",
+  "database_path": "runtime/backend.sqlite3",
+  "default_output_root": "runtime/downloads",
+  "allowed_output_roots": [
+    "runtime/downloads"
+  ],
+  "allowed_config_roots": [
+    "credentials"
+  ],
+  "allowed_cookie_roots": [
+    "credentials"
+  ],
+  "server": {
+    "host": "127.0.0.1",
+    "port": 8787,
+    "api_key": "",
+    "cors_origins": [],
+    "allow_private_targets": false
+  },
+  "gallery": {
+    "repo_path": "../gallery-dl-codeberg",
+    "python_executable": "",
+    "default_http_timeout": 30,
+    "default_retries": 2,
+    "terminate_grace_seconds": 5,
+    "max_log_line_chars": 4000
+  },
+  "proxy": {
+    "enabled": true,
+    "auto_start": true,
+    "engine": "native",
+    "subscription_urls": [],
+    "node_file": "",
+    "inline_nodes": [],
+    "allow_socks": true,
+    "max_nodes": 50,
+    "probe_url": "https://example.com/",
+    "probe_timeout_seconds": 5,
+    "probe_workers": 32,
+    "health_interval_seconds": 60,
+    "fail_cooldown_seconds": 30,
+    "subscription_timeout_seconds": 20,
+    "transport_core_enabled": true,
+    "transport_core_binary": "bin/proxy-core.exe",
+    "transport_core_sha256": "a3799f2d75c623a7c6d307e1faf88269e24dd746c59df3e9f1c84d5cfbff6c92",
+    "transport_core_base_port": 29000,
+    "transport_core_start_timeout_seconds": 15
+  },
+  "scheduler": {
+    "max_concurrent_tasks": 4,
+    "poll_interval_seconds": 0.5,
+    "shutdown_grace_seconds": 15,
+    "max_logs_per_task": 5000,
+    "retry_jitter_seconds": 0.5
+  },
+  "default_site_policy": {
+    "max_concurrency": 2,
+    "retry_limit": 2,
+    "backoff_base_seconds": 2,
+    "proxy_mode": "prefer",
+    "probe_url": null,
+    "probe_before_use": false,
+    "node_tags": [],
+    "http_timeout": 30,
+    "gallery_retries": 2,
+    "task_timeout_seconds": 0,
+    "extra_args": []
+  }
+}

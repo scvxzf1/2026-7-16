@@ -271,7 +271,7 @@ def fetch_subscription_body(url: str, *, timeout: float = 20.0) -> Tuple[str, st
     req = Request(
         url,
         headers={
-            "User-Agent": "Mozilla/5.0 (compatible; grok-protocol-proxy-sub/1.0)",
+            "User-Agent": "Mozilla/5.0 (compatible; proxy-pool-subscription/1.0)",
             "Accept": "*/*",
         },
         method="GET",

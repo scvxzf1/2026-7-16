@@ -1,0 +1,233 @@
+from __future__ import annotations
+
+import asyncio
+import os
+import re
+import subprocess
+import sys
+import uuid
+from collections import deque
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Awaitable, Callable
+
+from .config import GallerySettings
+from .process_control import terminate_process
+from .redaction import redact_text
+
+
+LineCallback = Callable[[str, str], Awaitable[None]]
+StartedCallback = Callable[[int, str], Awaitable[None]]
+
+
+@dataclass(slots=True)
+class GalleryRunResult:
+    exit_code: int | None
+    output_tail: str
+    timed_out: bool
+    marker: str
+    pid: int
+
+
+class GalleryRunner:
+    def __init__(self, settings: GallerySettings, backend_root: Path) -> None:
+        self.settings = settings
+        self.backend_root = backend_root.resolve()
+        self._active: dict[str, tuple[asyncio.subprocess.Process, str]] = {}
+        self._lock = asyncio.Lock()
+
+    def validate_args(self, args: list[str]) -> list[str]:
+        values = [str(arg) for arg in args]
+        forbidden = list(self.settings.forbidden_args)
+        for arg in values:
+            for item in forbidden:
+                if arg == item or arg.startswith(item + "="):
+                    raise ValueError(f"gallery-dl 参数由后端管理: {item}")
+                if item in {"-d", "-D", "-S", "-o", "-c", "-C", "-u", "-p"} and arg.startswith(item):
+                    raise ValueError(f"gallery-dl 参数由后端管理: {item}")
+        return values
+
+    @staticmethod
+    def _config_args(config_file: str | None) -> list[str]:
+        if not config_file:
+            return []
+        suffix = Path(config_file).suffix.lower()
+        if suffix in {".yaml", ".yml"}:
+            return ["--config-yaml", config_file]
+        if suffix == ".toml":
+            return ["--config-toml", config_file]
+        if suffix == ".json":
+            return ["--config-json", config_file]
+        return ["--config", config_file]
+
+    @staticmethod
+    def _credentials(credentials_ref: str | None) -> tuple[str, str]:
+        if not credentials_ref:
+            return "", ""
+        key = re.sub(r"[^A-Za-z0-9]", "_", credentials_ref).upper()
+        prefix = f"GDL_CREDENTIAL_{key}_"
+        return os.environ.get(prefix + "USERNAME", ""), os.environ.get(prefix + "PASSWORD", "")
+
+    def build_command(
+        self,
+        *,
+        marker: str,
+        url: str,
+        output_dir: str,
+        proxy_url: str | None,
+        http_timeout: float,
+        gallery_retries: int,
+        cookies_file: str | None,
+        config_file: str | None,
+        extra_args: list[str],
+    ) -> list[str]:
+        command = [
+            self.settings.python_executable or sys.executable,
+            "-m",
+            "gdl_backend.worker_entry",
+            "--marker",
+            marker,
+            "--gallery-root",
+            str(self.settings.repo_path),
+            "--",
+            "--config-ignore",
+            "--no-colors",
+            "--no-input",
+            "--destination",
+            output_dir,
+            "--http-timeout",
+            str(float(http_timeout)),
+            "--retries",
+            str(int(gallery_retries)),
+        ]
+        command.extend(self._config_args(config_file))
+        if cookies_file:
+            command.extend(["--cookies", cookies_file])
+        if proxy_url:
+            command.extend(["--proxy", proxy_url])
+        command.extend(self.validate_args(extra_args))
+        command.append(url)
+        return command
+
+    async def run(
+        self,
+        task_id: str,
+        *,
+        url: str,
+        output_dir: str,
+        proxy_url: str | None,
+        http_timeout: float,
+        gallery_retries: int,
+        task_timeout: float,
+        cookies_file: str | None,
+        config_file: str | None,
+        credentials_ref: str | None,
+        extra_args: list[str],
+        on_line: LineCallback,
+        on_started: StartedCallback,
+    ) -> GalleryRunResult:
+        if not (self.settings.repo_path / "gallery_dl" / "__init__.py").is_file():
+            raise FileNotFoundError(f"gallery-dl 源码目录无效: {self.settings.repo_path}")
+        marker = f"{task_id}-{uuid.uuid4().hex}"
+        command = self.build_command(
+            marker=marker,
+            url=url,
+            output_dir=output_dir,
+            proxy_url=proxy_url,
+            http_timeout=http_timeout,
+            gallery_retries=gallery_retries,
+            cookies_file=cookies_file,
+            config_file=config_file,
+            extra_args=extra_args,
+        )
+        env = os.environ.copy()
+        env["PYTHONUNBUFFERED"] = "1"
+        env["PYTHONIOENCODING"] = "utf-8"
+        pythonpath = [str(self.backend_root), str(self.settings.repo_path)]
+        if env.get("PYTHONPATH"):
+            pythonpath.append(env["PYTHONPATH"])
+        env["PYTHONPATH"] = os.pathsep.join(pythonpath)
+        username, password = self._credentials(credentials_ref)
+        if username:
+            env["GDL_WORKER_USERNAME"] = username
+        if password:
+            env["GDL_WORKER_PASSWORD"] = password
+
+        kwargs: dict[str, object] = {
+            "cwd": str(self.settings.repo_path),
+            "env": env,
+            "stdout": asyncio.subprocess.PIPE,
+            "stderr": asyncio.subprocess.PIPE,
+        }
+        if os.name == "nt":
+            kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            kwargs["start_new_session"] = True
+        process = await asyncio.create_subprocess_exec(*command, **kwargs)
+        async with self._lock:
+            self._active[task_id] = (process, marker)
+        await on_started(process.pid, marker)
+
+        tail: deque[str] = deque(maxlen=250)
+
+        async def read_stream(stream: asyncio.StreamReader | None, name: str) -> None:
+            if stream is None:
+                return
+            while True:
+                raw = await stream.readline()
+                if not raw:
+                    break
+                line = raw.decode("utf-8", "replace").rstrip("\r\n")
+                safe = redact_text(line, secrets=(username, password), limit=self.settings.max_log_line_chars)
+                tail.append(f"[{name}] {safe}")
+                await on_line(name, safe)
+
+        readers = [
+            asyncio.create_task(read_stream(process.stdout, "stdout")),
+            asyncio.create_task(read_stream(process.stderr, "stderr")),
+        ]
+        timed_out = False
+        try:
+            if task_timeout and task_timeout > 0:
+                try:
+                    await asyncio.wait_for(process.wait(), timeout=task_timeout)
+                except asyncio.TimeoutError:
+                    timed_out = True
+                    await terminate_process(process, self.settings.terminate_grace_seconds)
+            else:
+                await process.wait()
+        finally:
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*readers, return_exceptions=True),
+                    timeout=max(2.0, self.settings.terminate_grace_seconds),
+                )
+            except asyncio.TimeoutError:
+                for reader in readers:
+                    reader.cancel()
+                await asyncio.gather(*readers, return_exceptions=True)
+            async with self._lock:
+                current = self._active.get(task_id)
+                if current and current[0] is process:
+                    self._active.pop(task_id, None)
+        return GalleryRunResult(process.returncode, "\n".join(tail), timed_out, marker, process.pid)
+
+    async def cancel(self, task_id: str) -> bool:
+        async with self._lock:
+            active = self._active.get(task_id)
+        if active is None:
+            return False
+        await terminate_process(active[0], self.settings.terminate_grace_seconds)
+        return True
+
+    async def stop_all(self) -> None:
+        async with self._lock:
+            active = list(self._active.values())
+        await asyncio.gather(
+            *(terminate_process(process, self.settings.terminate_grace_seconds) for process, _ in active),
+            return_exceptions=True,
+        )
+
+    async def active_count(self) -> int:
+        async with self._lock:
+            return len(self._active)

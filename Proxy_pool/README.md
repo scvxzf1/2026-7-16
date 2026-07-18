@@ -1,8 +1,6 @@
-# 代理池（从 grok 协议项目抽出）
+# 独立代理池参考模块
 
-独立可复用的代理能力包，路径：
-
-`/home/scv/nvme0n1p1/构思-成功/大合集/代理池`
+独立可复用的代理能力包，位于当前仓库的 `Proxy_pool/`。
 
 ## 模块
 
@@ -76,7 +74,7 @@ cd /home/scv/nvme0n1p1/构思-成功/大合集/代理池
 python -m unittest discover -s tests -v
 ```
 
-说明：`test_proxy_subscription` 在原项目里依赖 webui/http_batch，未整包拷入；订阅解析可直接 import `proxy_subscription` 使用。
+说明：依赖早期宿主应用 `webui/http_batch` 的集成测试在这些模块缺席时自动跳过；订阅解析可直接 import `proxy_subscription` 使用。
 
 ## 性能优化（P0–P2，已落地）
 
@@ -134,4 +132,4 @@ python3 -m unittest tests.test_proxy_pool tests.test_proxy_subscription_perf tes
 
 ## 来源
 
-自 `/home/scv/nvme0n1p1/注册机相关/grok协议-es1/grok协议` 抽出，并在本目录完成 P0–P2 优化与单测。
+该模块由早期项目抽出，并在本目录完成 P0–P3 优化与单测。

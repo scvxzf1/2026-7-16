@@ -1,0 +1,11 @@
+# 每行一个可直接使用的代理节点：
+http://proxy.example:8080
+http://USERNAME:PASSWORD@proxy.example:8080
+proxy.example:8080:USERNAME:PASSWORD
+socks5://proxy.example:1080
+socks5h://proxy.example:1080
+
+# 带认证 SOCKS 会进入 skipped_nodes，避免认证信息进入子进程命令行。
+
+# Clash YAML 内的 VLESS/Hy2/AnyTLS/Trojan/VMess/SS/Mieru 可由 transport core
+# 映射为逐节点本地 HTTP 监听；单行分享链接当前作为来源 inventory 记录。

@@ -1,0 +1,49 @@
+# Operating-system and editor noise
+.DS_Store
+Thumbs.db
+Desktop.ini
+.idea/
+.vscode/
+*.swp
+*.tmp
+
+# Python caches, environments, coverage and build output (repository-wide)
+**/__pycache__/
+**/*.py[cod]
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+**/.tox/
+**/.coverage
+**/.coverage.*
+**/htmlcov/
+**/.venv/
+**/venv/
+**/dist/
+**/build/
+**/*.egg-info/
+
+# Generated state, logs and local databases
+**/.local/
+**/*.log
+**/*.db
+**/*.sqlite
+**/*.sqlite3
+/artifacts/
+/downloads/
+
+# Known sibling utilities that are outside this repository.  Keep them
+# excluded as well if they are ever copied into the worktree.
+/grok_tmp/
+/差分去除_优化版.py
+/三裁剪.py
+/视频帧提取.html
+
+# gallery-dl backend machine-local configuration and run output
+/gallery-dl-backend/config.json
+/gallery-dl-backend/credentials/
+/gallery-dl-backend/runtime/
+
+# Local airport subscriptions may contain connection credentials
+/CordCloud_Clash_*.yaml
+/subscriptions/
