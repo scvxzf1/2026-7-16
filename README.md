@@ -8,6 +8,18 @@
 | [`gallery-dl-codeberg/`](./gallery-dl-codeberg/) | 上游 gallery-dl 依赖，作为 Git submodule 保持源码边界 |
 | [`Proxy_pool/`](./Proxy_pool/) | 早期独立代理池参考模块 |
 
+## 平台支持
+
+当前对外支持等级为：**Windows 完整支持，Linux/macOS 兼容预览**。
+
+| 平台 | 支持等级 | 说明 |
+|---|---|---|
+| Windows | 完整支持 | 当前主要开发与端到端验证平台；仓库附带 Windows 版 Mihomo compatible `gallery-dl-backend/bin/proxy-core.exe`，并提供 PowerShell 启动脚本。 |
+| Linux | 兼容预览 | 后端 API、SQLite、POSIX 文件权限和子进程组管理已有实现。代理隧道功能需要自行安装 Mihomo compatible 核心，并配置二进制路径和 SHA-256；完整端到端回归仍待补齐。 |
+| macOS | 兼容预览 | 具备 POSIX 基础实现，也需要自行配置代理核心和 Chrome 路径。当前陈旧进程识别仍依赖 Linux `/proc`，重启后的孤儿任务清理尚待适配。 |
+
+更完整的运行说明见 [`gallery-dl-backend/README.md`](./gallery-dl-backend/README.md#平台支持)。
+
 首次检出：
 
 ```powershell
