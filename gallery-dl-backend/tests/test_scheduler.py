@@ -10,7 +10,7 @@ from gdl_backend.database import Database
 from gdl_backend.gallery import GalleryRunResult
 from gdl_backend.proxy import ProxyLease
 from gdl_backend.scheduler import TaskScheduler
-from gdl_backend.schemas import SitePolicy
+from gdl_backend.schemas import SitePolicy, TaskPolicy
 
 from tests.helpers import make_settings
 
@@ -41,9 +41,11 @@ class FakeProxy:
     def __init__(self, with_nodes: bool = False):
         self.with_nodes = with_nodes
         self.releases: list[tuple[str, bool]] = []
+        self.acquisitions: list[dict] = []
         self.counter = 0
 
     def acquire(self, task_id: str, **kwargs):
+        self.acquisitions.append({"task_id": task_id, **kwargs})
         if not self.with_nodes:
             return None
         self.counter += 1
@@ -139,6 +141,51 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(task["status"], "succeeded")
         self.assertEqual(gallery.calls[0]["proxy_url"], "http://127.0.0.1:28001")
         self.assertEqual(proxy.releases, [("task-1", False)])
+
+    async def test_ordered_task_uses_persisted_address_probe_allowlist(self):
+        self.db.create_crawl_batch(
+            {
+                "id": "batch-1",
+                "output_dir": str(self.root / "batch"),
+                "concurrency": 1,
+                "max_tasks": 10,
+            },
+            [
+                {
+                    "id": "address-1",
+                    "site": "example.com",
+                    "source_order": 0,
+                    "address_order": 0,
+                    "url": "https://example.com/gallery/1",
+                    "proxy_mode": "required",
+                    "max_attempts": 1,
+                }
+            ],
+        )
+        self.db.save_crawl_address_proxy_probe(
+            "address-1",
+            target_url="https://example.com/",
+            total_count=3,
+            healthy_node_ids=["node-a", "node-b"],
+        )
+        task_values = values(self.root, proxy_mode="required", attempts=1)
+        task_values["policy"] = TaskPolicy(
+            max_concurrency=1,
+            retry_limit=0,
+            proxy_mode="required",
+            proxy_probe_scope="address-1",
+        ).model_dump()
+        self.db.create_task(task_values)
+
+        gallery = FakeGallery([GalleryRunResult(0, "done", False, "m", 101)])
+        proxy = FakeProxy(with_nodes=True)
+        scheduler = TaskScheduler(self.db, gallery, proxy, self.settings.scheduler)
+        await scheduler.start()
+        task = await self.wait_terminal("task-1")
+        await scheduler.stop()
+
+        self.assertEqual(task["status"], "succeeded")
+        self.assertEqual(proxy.acquisitions[0]["allowed_ids"], {"node-a", "node-b"})
 
     async def test_prefer_falls_back_to_direct_when_pool_is_empty(self):
         self.db.create_task(values(self.root, proxy_mode="prefer", attempts=1))

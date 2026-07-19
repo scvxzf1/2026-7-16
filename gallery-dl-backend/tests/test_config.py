@@ -17,6 +17,9 @@ class ConfigDefaultsTests(unittest.TestCase):
         self.assertEqual(settings.proxy.engine, "native")
         self.assertTrue(settings.proxy.allow_socks)
         self.assertIsNone(settings.proxy.node_file)
+        self.assertEqual(settings.proxy.probe_timeout_seconds, 10.0)
+        self.assertFalse(hasattr(settings.proxy, "max_nodes"))
+        self.assertNotIn("max_nodes", settings.public_dict()["proxy"])
 
 
 if __name__ == "__main__":

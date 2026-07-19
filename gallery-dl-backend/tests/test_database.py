@@ -151,6 +151,21 @@ class DatabaseTests(unittest.TestCase):
         )
         self.assertFalse(created)
         self.assertEqual(duplicate, batch_id)
+
+        probe = self.db.save_crawl_address_proxy_probe(
+            "address-1",
+            target_url="https://x.com/",
+            total_count=3,
+            healthy_node_ids=["node-b", "node-a", "node-b"],
+        )
+        self.assertEqual(probe["healthy_count"], 2)
+        self.assertEqual(probe["node_ids"], ["node-a", "node-b"])
+        batch = self.db.get_crawl_batch(batch_id)
+        first_address = batch["sources"][0]["addresses"][0]
+        self.assertEqual(first_address["proxy_probe_target"], "https://x.com/")
+        self.assertEqual(first_address["probed_proxy_count"], 3)
+        self.assertEqual(first_address["healthy_proxy_count"], 2)
+
         self.assertEqual(self.db.next_crawl_address(batch_id)["id"], "address-1")
         self.assertTrue(self.db.begin_crawl_address_planning("address-1"))
 
@@ -230,6 +245,8 @@ class DatabaseTests(unittest.TestCase):
         path = self.root / "legacy.sqlite3"
         legacy = Database(path)
         with legacy._transaction() as conn:
+            conn.execute("DROP TABLE crawl_address_proxy_nodes")
+            conn.execute("DROP TABLE crawl_address_proxy_probes")
             conn.execute("DROP TABLE crawl_address_tasks")
             conn.execute("DROP TABLE crawl_addresses")
             conn.execute("DROP TABLE crawl_batches")
@@ -247,9 +264,15 @@ class DatabaseTests(unittest.TestCase):
                     "SELECT name FROM sqlite_master WHERE type='table'"
                 ).fetchall()
             }
-            self.assertEqual(version, "2")
+            self.assertEqual(version, "3")
             self.assertTrue(
-                {"crawl_batches", "crawl_addresses", "crawl_address_tasks"}.issubset(tables)
+                {
+                    "crawl_batches",
+                    "crawl_addresses",
+                    "crawl_address_tasks",
+                    "crawl_address_proxy_probes",
+                    "crawl_address_proxy_nodes",
+                }.issubset(tables)
             )
         finally:
             upgraded.close()

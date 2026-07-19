@@ -5,13 +5,15 @@ import hashlib
 import json
 from pathlib import Path
 from typing import Awaitable, Callable
+from urllib.parse import urlsplit
 
 from .crawl import CrawlPlanError, CrawlPlanner, CrawlUnit
 from .database import Database
 from .discovery import DiscoveryError, DiscoveryService
+from .proxy import ProxyPoolAdapter
 from .redaction import redact_text
 from .scheduler import TaskScheduler
-from .schemas import SitePolicy, TaskCreate
+from .schemas import SitePolicy, TaskCreate, TaskPolicy
 
 
 EnqueueTask = Callable[
@@ -19,6 +21,11 @@ EnqueueTask = Callable[
     Awaitable[tuple[dict, bool]],
 ]
 PolicyProvider = Callable[[str], SitePolicy]
+_TWITTER_MEDIA_HOSTS = {"pbs.twimg.com", "video.twimg.com"}
+
+
+def _is_twitter_media_url(site: str, url: str) -> bool:
+    return site == "twitter" and (urlsplit(url).hostname or "").lower() in _TWITTER_MEDIA_HOSTS
 
 
 class OrderedCrawlManager:
@@ -30,6 +37,7 @@ class OrderedCrawlManager:
         discovery: DiscoveryService,
         planner: CrawlPlanner,
         scheduler: TaskScheduler,
+        proxy: ProxyPoolAdapter,
         policy_for: PolicyProvider,
         *,
         poll_interval: float = 0.25,
@@ -38,6 +46,7 @@ class OrderedCrawlManager:
         self.discovery = discovery
         self.planner = planner
         self.scheduler = scheduler
+        self.proxy = proxy
         self.policy_for = policy_for
         self.poll_interval = max(0.05, float(poll_interval))
         self._enqueue: EnqueueTask | None = None
@@ -141,7 +150,13 @@ class OrderedCrawlManager:
                     "crawl_plan_too_large",
                     f"批次媒体任务达到 max_tasks={batch['max_tasks']}",
                 )
-            policy = self.policy_for(address["site"])
+            policy = await self._probe_address_policy(
+                address,
+                self.policy_for(address["site"]),
+            )
+            latest = self.db.get_crawl_batch(batch["id"])
+            if latest is None or latest["cancel_requested"]:
+                return
             units = await self._plan_address(address, policy=policy, max_tasks=remaining)
             deduplicated = self._deduplicate(units)
             if not deduplicated:
@@ -165,18 +180,22 @@ class OrderedCrawlManager:
                 if latest is None or latest["cancel_requested"]:
                     await cancel_linked()
                     return
+                unit_site = unit.site or address["site"]
+                direct_twitter_media = _is_twitter_media_url(unit_site, unit.url)
                 task_body = TaskCreate(
                     url=unit.url,
-                    site=unit.site or address["site"],
+                    site=unit_site,
                     output_dir=str(address_output),
                     proxy_mode=address["proxy_mode"],
                     max_attempts=address["max_attempts"],
                     priority=address["priority"],
                     credentials_ref=address.get("credentials_ref"),
-                    cookies_file=address.get("cookies_file"),
+                    cookies_file=None if direct_twitter_media else address.get("cookies_file"),
                     config_file=address.get("config_file"),
                     extra_args=[*address.get("extra_args", []), *unit.extra_args],
                 )
+                task_body._policy_override = policy
+                task_body._skip_managed_credentials = direct_twitter_media
                 key = f"crawl:{batch['id']}:{address['id']}:{digest[:48]}"
                 task, _created = await self._enqueue(
                     task_body,
@@ -226,6 +245,73 @@ class OrderedCrawlManager:
                     return
                 self.db.fail_crawl_address(address["id"], error)
                 self.db.finish_crawl_batch_if_ready(batch["id"])
+
+    @staticmethod
+    def _probe_target(address: dict, policy: SitePolicy) -> str:
+        if policy.probe_url:
+            return policy.probe_url
+        parsed = urlsplit(str(address["url"]))
+        host = parsed.hostname
+        if not host:
+            raise CrawlPlanError("invalid_probe_target", "图站地址缺少可探活的主机名")
+        authority = f"[{host}]" if ":" in host else host
+        if parsed.port and parsed.port != 443:
+            authority = f"{authority}:{parsed.port}"
+        return f"https://{authority}/"
+
+    async def _probe_address_policy(
+        self,
+        address: dict,
+        policy: SitePolicy,
+    ) -> TaskPolicy:
+        scoped = TaskPolicy.model_validate(policy.model_dump())
+        if address["proxy_mode"] == "direct":
+            return scoped
+
+        target = self._probe_target(address, policy)
+        try:
+            result = await asyncio.to_thread(self.proxy.probe, target_url=target)
+            healthy_node_ids = sorted(
+                {
+                    str(item["id"])
+                    for item in result.get("results", [])
+                    if item.get("healthy") and item.get("id")
+                }
+            )
+            self.db.save_crawl_address_proxy_probe(
+                address["id"],
+                target_url=target,
+                total_count=int(result.get("total") or 0),
+                healthy_node_ids=healthy_node_ids,
+            )
+        except Exception as exc:
+            error = redact_text(exc, limit=1000)
+            healthy_node_ids = []
+            self.db.save_crawl_address_proxy_probe(
+                address["id"],
+                target_url=target,
+                total_count=0,
+                healthy_node_ids=[],
+                error=error,
+            )
+            if address["proxy_mode"] == "required":
+                raise CrawlPlanError(
+                    "proxy_probe_failed",
+                    f"{address['site']} 代理探活失败: {error}",
+                ) from exc
+
+        if address["proxy_mode"] == "required" and not healthy_node_ids:
+            raise CrawlPlanError(
+                "proxy_unavailable",
+                f"{address['site']} 图站探活后没有可用代理节点",
+            )
+        return scoped.model_copy(
+            update={
+                "probe_url": target,
+                "proxy_probe_scope": address["id"],
+                "allowed_proxy_ids": healthy_node_ids,
+            }
+        )
 
     async def _plan_address(
         self,

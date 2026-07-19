@@ -3,17 +3,10 @@ from __future__ import annotations
 import re
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator, model_validator
 
 
 ProxyMode = Literal["direct", "prefer", "required"]
-class PixivOAuthCompleteRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    session_id: str = Field(min_length=16, max_length=128, pattern=r"^[a-fA-F0-9]+$")
-    callback: str = Field(min_length=1, max_length=8192)
-
-
 class SitePolicy(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -57,8 +50,25 @@ class SitePolicy(BaseModel):
         return [str(value) for value in values]
 
 
+class TaskPolicy(SitePolicy):
+    """Persisted task policy plus an address-scoped proxy probe constraint."""
+
+    proxy_probe_scope: str | None = Field(default=None, min_length=1, max_length=128)
+    allowed_proxy_ids: list[str] | None = Field(default=None, max_length=2048, exclude=True)
+
+    @field_validator("allowed_proxy_ids")
+    @classmethod
+    def normalize_proxy_ids(cls, values: list[str] | None) -> list[str] | None:
+        if values is None:
+            return None
+        return list(dict.fromkeys(str(value).strip() for value in values if str(value).strip()))
+
+
 class TaskCreate(BaseModel):
     model_config = ConfigDict(extra="forbid")
+
+    _policy_override: TaskPolicy | None = PrivateAttr(default=None)
+    _skip_managed_credentials: bool = PrivateAttr(default=False)
 
     url: str = Field(min_length=4, max_length=8192)
     site: str | None = Field(default=None, min_length=1, max_length=128)

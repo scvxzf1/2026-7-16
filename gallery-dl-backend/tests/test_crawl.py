@@ -53,6 +53,59 @@ class CrawlPlannerTests(unittest.TestCase):
                 )
             )
 
+    def test_twitter_media_urls_bypass_status_page_ranges(self):
+        planner = CrawlPlanner(object())
+        media_urls = [
+            "https://pbs.twimg.com/media/sample?format=jpg&name=orig",
+            "https://video.twimg.com/ext_tw_video/123/pu/vid/1280x720/sample.mp4?tag=12",
+            "https://pbs.twimg.com/media/unexpected?format=jpg&name=orig",
+        ]
+        units, _proxies = asyncio.run(
+            planner.plan_media(
+                [
+                    {
+                        "id": "123",
+                        "site": "twitter",
+                        "kind": "work",
+                        "download_url": "https://x.com/example/status/123",
+                        "media_count": 2,
+                        "media_urls": media_urls,
+                        "extra_args": ["--sleep", "0"],
+                    }
+                ],
+                policy=SitePolicy(proxy_mode="direct"),
+                proxy_mode="direct",
+                cookies_file=None,
+                max_tasks=10,
+            )
+        )
+        self.assertEqual([unit.url for unit in units], media_urls[:2])
+        self.assertEqual([unit.source_id for unit in units], ["123:1", "123:2"])
+        self.assertEqual([unit.extra_args for unit in units], [["--sleep", "0"]] * 2)
+        self.assertTrue(all("--range" not in unit.extra_args for unit in units))
+
+        fallback, _proxies = asyncio.run(
+            planner.plan_media(
+                [
+                    {
+                        "id": "partial",
+                        "site": "twitter",
+                        "url": "https://x.com/example/status/456",
+                        "media_count": 2,
+                        "media_urls": media_urls[:1],
+                    }
+                ],
+                policy=SitePolicy(proxy_mode="direct"),
+                proxy_mode="direct",
+                cookies_file=None,
+                max_tasks=10,
+            )
+        )
+        self.assertEqual(
+            [unit.extra_args for unit in fallback],
+            [["--range", "1"], ["--range", "2"]],
+        )
+
     def test_eh_index_parser(self):
         page = """
         <h1 id="gn">A &amp; B</h1>

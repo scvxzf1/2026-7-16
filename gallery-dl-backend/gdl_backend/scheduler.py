@@ -14,7 +14,7 @@ from .gallery import GalleryRunner
 from .process_control import terminate_stale_process
 from .proxy import ProxyLease, ProxyPoolAdapter
 from .redaction import redact_text
-from .schemas import SitePolicy
+from .schemas import TaskPolicy
 
 
 class TaskScheduler:
@@ -78,8 +78,16 @@ class TaskScheduler:
     def notify(self) -> None:
         self._wake.set()
 
-    def _policy(self, task: dict[str, Any]) -> SitePolicy:
-        return SitePolicy.model_validate(task.get("policy") or {})
+    def _policy(self, task: dict[str, Any]) -> TaskPolicy:
+        return TaskPolicy.model_validate(task.get("policy") or {})
+
+    def _allowed_proxy_ids(self, policy: TaskPolicy) -> set[str] | None:
+        if policy.allowed_proxy_ids is not None:
+            return set(policy.allowed_proxy_ids)
+        if not policy.proxy_probe_scope:
+            return None
+        probe = self.db.get_crawl_address_proxy_probe(policy.proxy_probe_scope)
+        return set(probe["node_ids"]) if probe is not None else set()
 
     async def _dispatch_loop(self) -> None:
         while not self._stopping:
@@ -172,7 +180,7 @@ class TaskScheduler:
         decision = FailureDecision("backend_error", False, False, "后端任务初始化失败")
         exit_code: int | None = None
         task: dict[str, Any] | None = None
-        policy: SitePolicy | None = None
+        policy: TaskPolicy | None = None
         auth_failure_context = ""
         try:
             attempt = self.db.begin_attempt(task_id)
@@ -190,12 +198,14 @@ class TaskScheduler:
             proxy_mode = task["proxy_mode"]
             if proxy_mode != "direct":
                 tried = set(task.get("tried_proxy_ids") or [])
+                allowed_proxy_ids = self._allowed_proxy_ids(policy)
                 try:
                     lease = await asyncio.to_thread(
                         self.proxy.acquire,
                         task_id,
                         node_tags=policy.node_tags,
                         exclude_ids=tried,
+                        allowed_ids=allowed_proxy_ids,
                         probe_before_use=policy.probe_before_use,
                         probe_url=policy.probe_url,
                     )

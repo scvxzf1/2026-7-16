@@ -19,13 +19,13 @@
 - 单任务固定一个代理节点，代理故障后排除旧节点并换节点重试；
 - `direct`、`prefer`、`required` 三种代理策略；
 - HTTP/HTTPS/SOCKS 原生代理池，以及 Clash 隧道节点到本地 HTTP 出口的自动桥接；
-- Base64、纯文本及 Clash YAML 机场订阅导入；
+- Base64、纯文本、Clash YAML/JSON、sing-box JSON 及 SIP008 机场订阅导入；
 - 带 Basic Auth 的 HTTP 上游自动包装为任务级本地无认证转发端口；
 - 全池探活和站点专用 HTTPS 探活；
 - 节点标签/地区筛选、冷却、延迟、成功/失败统计；
 - 任务取消、Windows 子进程树回收、重启孤儿任务恢复；
 - 日志轮询、事件流、任务文件清单和文件读取；
-- API Key、输出目录白名单、配置/Cookie 文件白名单、敏感信息脱敏；
+- 本机回环监听、输出目录白名单、配置/Cookie 文件白名单；
 - Idempotency-Key 防止重复提交。
 
 ## 架构
@@ -60,7 +60,8 @@ Copy-Item config.example.json config.json
 
 ## 配置节点
 
-在 `config.json` 中填写订阅后，后端启动时自动拉取、解析、去重并探活代理：
+在 `config.json` 中填写订阅后，后端启动时先完整拉取、解析并加载全部节点，再对运行池执行探活。
+节点没有数量上限，导入多少就加载和探活多少；`probe_timeout_seconds` 默认是 10 秒：
 
 ```json
 {
@@ -91,11 +92,11 @@ Copy-Item config.example.json config.json
 }
 ```
 
-节点文件格式见 `nodes.example.txt`。订阅 URL 和认证信息经过脱敏，不会出现在任务日志中。
+节点文件格式见 `nodes.example.txt`。
 
-原生路径直接接收 HTTP/HTTPS 以及无认证 SOCKS 节点。带认证 HTTP/HTTPS 代理由本地转发器隐藏凭据；带认证 SOCKS 节点计入 `skipped_nodes`，避免把凭据放入 gallery-dl 子进程命令行。
+原生路径直接接收 HTTP/HTTPS 以及无认证 SOCKS 节点。带认证 HTTP/HTTPS 代理由本地转发器承接，带认证 SOCKS5 节点通过传输核心桥接。
 
-Clash YAML 中的 VLESS、Hysteria2、AnyTLS、Trojan、VMess、Shadowsocks、Mieru 节点由 `proxy_core` 生成“一节点一监听”的本地 HTTP 出口，再统一进入 `NativeProxyPool`。项目内的 `bin/proxy-core.exe` 是经官方发布 SHA-256 校验的 Mihomo compatible 构建；每次启动还会按 `transport_core_sha256` 重新核验文件。启动、配置校验、监听就绪检测和关闭均随后端生命周期自动执行，用户侧只运行后端命令。核心状态位于 `/api/v1/proxy/status` 的 `transport_core` 字段。
+常见分享 URI、Clash 与 sing-box 中的 VLESS、VMess、Trojan、Shadowsocks/SSR、Hysteria/Hysteria2、TUIC、AnyTLS、Mieru 节点由 `proxy_core` 生成“一节点一监听”的本地 HTTP 出口，再统一进入 `NativeProxyPool`。项目内的 `bin/proxy-core.exe` 是经官方发布 SHA-256 校验的 Mihomo compatible 构建；每次启动还会按 `transport_core_sha256` 重新核验文件。启动、配置校验、监听就绪检测和关闭均随后端生命周期自动执行，用户侧只运行后端命令。核心状态位于 `/api/v1/proxy/status` 的 `transport_core` 字段。节点状态中的 `healthy` 表示最近一次探活成功，`retry_eligible` 只表示冷却已经结束、当前可以再次尝试，两者互不替代。
 
 ## 启动
 
@@ -117,21 +118,15 @@ python -m gdl_backend --config .\config.json
 - 健康检查：`/healthz`
 - 就绪检查：`/readyz`
 
-若配置了 `server.api_key` 或环境变量 `GDL_BACKEND_API_KEY`，调用 `/api/v1/*` 时添加：
-
-```text
-X-API-Key: YOUR_KEY
-```
-
-服务默认绑定回环地址，并拒绝任务/探活目标解析到回环、私网、链路本地或保留 IP。确需抓取局域网图站时，在本地部署的 `server` 配置中设置 `"allow_private_targets": true`。监听地址扩展到非回环接口时，启动校验要求同时配置 API Key。
+服务仅允许绑定回环地址，并拒绝任务/探活目标解析到回环、私网、链路本地或保留 IP。确需抓取局域网图站时，在本地部署的 `server` 配置中设置 `"allow_private_targets": true`。
 
 ### 聚合爬取测试台
 
 `/ui/` 是随 Python 包一起提供的纯静态测试界面，无需 Node.js 或前端构建步骤。它覆盖：
 
 - 代理池状态、启动、重载、探活和停止；
-- 统一的站点登录授权中心：X/EH 打开项目专属 Chrome 登录窗口并持久化托管 Cookie，
-  Pixiv 使用托管 OAuth，Danbooru 公共 API 自动就绪；
+- 统一的站点登录授权中心：X、Pixiv、EH 共用一个项目授权 Chrome Profile，
+  X/EH 自动导出 Cookie，Pixiv 使用托管 OAuth，Danbooru 公共 API 自动就绪；
 - X、Pixiv、Danbooru、EH 聚合关键词搜索；
 - 按来源查看并勾选账号、标签或画廊地址；EH 直接展示站内候选的封面、标题、页数和标签，并可按
   官方 namespace 进行包含/排除过滤，X/Pixiv
@@ -140,10 +135,6 @@ X-API-Key: YOUR_KEY
 - 以指定图片并发数提交顺序批次；
 - 轮询批次、当前地址和图片任务状态，并支持取消批次；
 - 展示 Danbooru 人工维护的其他活动平台主页和原始 API 响应。
-
-API Key 仅保存在当前浏览器标签页的 `sessionStorage` 中，并随每次 `/api/v1/*`
-请求通过 `X-API-Key` 发送。站点 Cookie、OAuth Token 和 gallery-dl 缓存只保存在后端
-忽略目录；WebUI 接收状态元数据，不读取或回显凭据值。
 
 ## 常用 API
 
@@ -179,34 +170,42 @@ POST   /api/v1/auth/{site}/login/start
 GET    /api/v1/auth/{site}/login/{session_id}
 DELETE /api/v1/auth/{site}/login/{session_id}
 POST   /api/v1/auth/pixiv/oauth/start
-POST   /api/v1/auth/pixiv/oauth/complete
 DELETE /api/v1/auth/pixiv/oauth/session
+DELETE /api/v1/auth/browser-profile
 DELETE /api/v1/auth/{site}
 ```
 
-- X：后端打开 `credentials/managed/browser-profiles/twitter/` 对应的项目专属 Chrome，
-  登录成功后保存 `x.com`/`twitter.com` Cookie；
-- EH：后端打开独立的 `browser-profiles/exhentai/` Chrome，登录成功后保存
-  E-Hentai/ExHentai Cookie；
-- Pixiv：登录授权产生的 refresh-token 写入后端专用 gallery-dl cache；
+- X：在 `credentials/managed/browser-profiles/shared/` 对应的共享项目 Chrome 中登录，
+  后端导出 `x.com`/`twitter.com` Cookie；
+- EH：复用同一个共享 Profile，后端导出 E-Hentai/ExHentai Cookie；
+- Pixiv：复用同一个共享 Profile，在 OAuth 页面导航前启用 CDP Network 监听，自动捕获
+  callback 并把 refresh-token 写入后端专用 gallery-dl cache；
 - Danbooru：当前画师/角色标签搜索和公共作品抓取直接使用公开 API。
 
-X/EH 首次登录后会关闭专属窗口并长期复用项目内凭证，不读取用户日常浏览器的数据，
-也没有浏览器选择、Cookie 数据库导入或手工 Cookie 同步流程。只有搜索、规划或下载实际返回
+X、Pixiv、EH 的 Cookie、本地存储、设备历史和验证状态都由共享 Profile 持久化。授权完成时只关闭
+本次标签页，Chrome 宿主继续运行并供下一个站点复用；后端退出时关闭宿主进程而保留 Profile。
+所有流程均不读取用户日常浏览器的数据，也没有浏览器选择、Cookie 数据库导入或手工 Cookie
+同步流程。只有搜索、规划或下载实际返回
 认证错误时，后端才把对应凭证标记为失效；WebUI 显示重新授权提示，尚未启动的同站托管任务
 保留在队列，重新登录成功后自动恢复调度。
 
 Chrome 默认从系统路径自动发现；便携版可通过 `auth.chrome_executable` 指定。登录窗口等待时间和
 CDP 轮询间隔分别由 `auth.browser_login_timeout_seconds`、
 `auth.browser_poll_interval_seconds` 配置。
-专属窗口使用随机非零的回环调试端口，页面中的 `navigator.webdriver` 保持关闭；重新授权只清理
-站点登录 Cookie，Cloudflare clearance 等验证状态会保留在该站专属 profile 中。
+共享授权浏览器使用随机非零的回环调试端口；启动参数和页面脚本均不修改浏览器指纹。
+重新授权直接复用共享 Profile 中的站点状态。
 X 仅在 `auth_token`、`ct0` 均已生成且页面离开登录流和 `/account/access` 检查页后才持久化成功状态。
 
-Pixiv 登录授权不会要求用户填写 Token。开始授权后打开 Pixiv 登录页，将浏览器最后一个
-`callback?state=...` 请求 URL 粘贴回授权面板，后端完成交换并保存；API 响应、任务数据库
-和事件日志均不包含 refresh-token。交换使用单次会话隔离 cache，成功后才更新现有登录；
-取消或交换失败会清理临时 cache，并保留此前有效登录。
+Pixiv 登录授权不要求填写 Token 或复制 callback。开始授权后，后端在共享项目 Chrome 的
+目标页上先启用 Network 监听再导航到登录页；登录产生的短时 callback 会被即时捕获、交换并保存，
+随后自动关闭本次标签页。API 响应、任务数据库和事件日志均不包含授权码或 refresh-token。
+共享窗口保持真实的宿主 Chrome UA、GPU、屏幕、时区和硬件信息。
+交换使用单次会话隔离 cache，成功后才更新现有登录；取消或交换失败会清理临时 cache，
+并保留此前有效登录。
+
+`DELETE /api/v1/auth/{site}` 只删除该站后端导出的 Cookie 或 Token，共享 Profile 中的浏览器登录
+状态继续保留。`DELETE /api/v1/auth/browser-profile` 会先停止所有授权会话和共享 Chrome，再删除
+整个共享 Profile；已经导出的站点凭证仍通过各站点接口分别管理。
 
 站点探活示例：
 
@@ -363,7 +362,14 @@ Danbooru artist tag：内部图片最多 20 并发
 ```
 
 当前地址结束后才会创建下一个地址的图片任务。每张图片是独立持久化任务，分别从
-代理池取得节点；代理故障时按站点策略冷却并轮换。`concurrency` 受全局调度上限
+代理池取得节点；每个新地址开始规划前，后端先对该地址所属图站执行全池 HTTPS 探活，
+规划请求及随后生成的图片任务只使用本次通过的节点。探活结果按地址持久化，服务重启后
+仍保持相同筛选范围；切换到下一个地址时重新探活。代理故障时按站点策略冷却并轮换。
+X 账号枚举会复用同一次规划得到的 `pbs.twimg.com` / `video.twimg.com` 媒体直链，每个直链
+直接建立下载任务，避免为每张图重复请求 X 状态页 API；直链信息不完整时保留状态页回退。
+Pixiv 规划只保留每个作品的首个协议 URL，真实页数仍由作品元数据读取，避免多页作品在
+规划 JSON 中重复写入全部图片元数据。元数据进程超时后的管道清理也有独立时限。
+`concurrency` 受全局调度上限
 二次约束，项目默认值为 20。`max_tasks` 是整个批次的媒体任务规模上限。
 规划器会额外探测一个作品/帖子，超过上限时将该地址标记为规划错误，以免把账号或
 标签图库静默截断；提高 `max_tasks` 后可重新提交完整批次。
@@ -440,7 +446,8 @@ PUT /api/v1/sites/policies/pixiv
 ## 托管授权与兼容凭据
 
 默认工作流使用 `/api/v1/auth` 的托管授权。后端在创建搜索、单任务或顺序批次时，按照站点
-自动附加托管 Cookie 和专用 gallery-dl cache，WebUI 无需提交凭据路径。首次启用时还会将
+自动附加托管 Cookie 和专用 gallery-dl cache；X 媒体 CDN 直链任务不附加 Cookie。WebUI
+无需提交凭据路径。首次启用时还会将
 当前 Windows 用户 gallery-dl 全局缓存中的 Pixiv 登录复制到项目托管缓存，迁移过程不输出
 Token。
 
@@ -454,15 +461,15 @@ $env:GDL_CREDENTIAL_DANBOORU_MAIN_USERNAME = "USER"
 $env:GDL_CREDENTIAL_DANBOORU_MAIN_PASSWORD = "API_KEY"
 ```
 
-兼容凭据通过子进程环境注入，在 worker 内部追加到 gallery-dl 参数，后端日志及数据库执行
-脱敏处理。托管 Cookie 位于 `credentials/managed/`，X/EH 专属 Chrome 配置位于其
-`browser-profiles/` 子目录，Pixiv Token 位于后端专用 SQLite cache；这些内容均由
-`.gitignore` 排除。托管目录和文件同时收紧本机访问权限。
+兼容凭据通过子进程环境注入，在 worker 内部追加到 gallery-dl 参数。托管 Cookie 位于
+`credentials/managed/`，X/Pixiv/EH 共用的 Chrome 配置位于 `browser-profiles/shared/`，
+Pixiv Token 位于后端专用 SQLite cache。
 
 ## 失败处理
 
 - ProxyError、CONNECT tunnel、407、TLS/SSL 握手和连接拒绝：节点标记失败并进入冷却；
 - 429、502、503、504：站点级临时错误，重试但不处罚节点；
+- 旧式 X 状态页任务关闭 Cookie 回写，避免多个 worker 争写同一托管 Cookie 文件；
 - 登录错误会使对应项目托管凭证进入待重新授权状态，并暂停后续同站排队任务；当前失败任务进入终态；
 - 输入错误、不支持 URL、资源不存在：直接进入终态；
 - 公共 EH 画廊在特定出口返回 `Insufficient privileges`：冷却该出口并换节点重试；

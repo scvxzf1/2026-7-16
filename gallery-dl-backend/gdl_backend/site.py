@@ -32,7 +32,7 @@ class SiteResolver:
         pos = lower.find("http://")
         pos2 = lower.find("https://")
         starts = [p for p in (pos, pos2) if p >= 0]
-        return text[min(starts)] if starts else text
+        return text[min(starts) :] if starts else text
 
     @staticmethod
     def _host(value: str) -> str:
@@ -70,6 +70,8 @@ class SiteResolver:
         category = str(getattr(extractor, "category", "") or fallback).lower()
         subcategory = str(getattr(extractor, "subcategory", "") or "").lower()
         class_name = extractor.__class__.__name__
-        if category in {"generic", "directlink", "recursive"} and host:
+        if host in {"pbs.twimg.com", "video.twimg.com"}:
+            category = "twitter"
+        elif category in {"generic", "directlink", "recursive"} and host:
             category = host
         return SiteInfo(category, subcategory, class_name, True, host)

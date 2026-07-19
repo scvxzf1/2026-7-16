@@ -4,6 +4,7 @@ import hashlib
 import re
 import threading
 import time
+from collections.abc import Collection
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -48,7 +49,7 @@ class _NodeRecord:
     protocol: str
     endpoint: str = field(repr=False)
     tags: list[str] = field(default_factory=list)
-    healthy: bool = True
+    healthy: bool = False
     success_count: int = 0
     fail_count: int = 0
     last_latency_ms: float | None = None
@@ -215,13 +216,6 @@ class ProxyPoolAdapter:
                 )
             )
 
-        if len(records) > self.settings.max_nodes:
-            skipped += len(records) - self.settings.max_nodes
-            records = records[: self.settings.max_nodes]
-        capacity = max(0, self.settings.max_nodes - len(records))
-        if len(core_candidates) > capacity:
-            skipped += len(core_candidates) - capacity
-            core_candidates = core_candidates[:capacity]
         self._set_records(records)
         with self._lock:
             self._core_candidates = list(core_candidates)
@@ -363,28 +357,28 @@ class ProxyPoolAdapter:
             running = self._running
             pool_status = self._pool.status() if self._pool is not None else {}
             now = time.time()
-            return [
-                {
-                    "id": record.id,
-                    "name": record.name,
-                    "protocol": record.protocol,
-                    "endpoint": mask_proxy(record.endpoint),
-                    "healthy": bool(
-                        running
-                        and float(pool_status.get(record.endpoint, {}).get("cooldown_left") or 0.0) <= 0
-                    ),
-                    "ref_count": 1 if pool_status.get(record.endpoint, {}).get("leased") else 0,
-                    "success_count": record.success_count,
-                    "fail_count": record.fail_count,
-                    "last_latency_ms": record.last_latency_ms,
-                    "cooldown_until": (
-                        now + float(pool_status.get(record.endpoint, {}).get("cooldown_left") or 0.0)
-                    ),
-                    "last_error": redact_text(record.last_error, limit=300),
-                    "tags": list(record.tags),
-                }
-                for record in records
-            ]
+            rows: list[dict[str, Any]] = []
+            for record in records:
+                status = pool_status.get(record.endpoint, {})
+                cooldown_left = float(status.get("cooldown_left") or 0.0)
+                rows.append(
+                    {
+                        "id": record.id,
+                        "name": record.name,
+                        "protocol": record.protocol,
+                        "endpoint": mask_proxy(record.endpoint),
+                        "healthy": bool(running and record.healthy),
+                        "retry_eligible": bool(running and cooldown_left <= 0),
+                        "ref_count": 1 if status.get("leased") else 0,
+                        "success_count": record.success_count,
+                        "fail_count": record.fail_count,
+                        "last_latency_ms": record.last_latency_ms,
+                        "cooldown_until": now + cooldown_left,
+                        "last_error": redact_text(record.last_error, limit=300),
+                        "tags": list(record.tags),
+                    }
+                )
+            return rows
 
     def status(self) -> dict[str, Any]:
         nodes = self._node_rows()
@@ -404,6 +398,7 @@ class ProxyPoolAdapter:
             "running": bool(self._running and self._pool is not None),
             "total": len(nodes),
             "healthy": sum(1 for node in nodes if node["healthy"]),
+            "retry_eligible": sum(1 for node in nodes if node["retry_eligible"]),
             "leases": len(self._leases),
             "last_error": self._last_error,
             "transport_core": core_status,
@@ -519,6 +514,7 @@ class ProxyPoolAdapter:
         *,
         node_tags: list[str] | None = None,
         exclude_ids: set[str] | None = None,
+        allowed_ids: Collection[str] | None = None,
         probe_before_use: bool = False,
         probe_url: str | None = None,
     ) -> ProxyLease | None:
@@ -537,11 +533,18 @@ class ProxyPoolAdapter:
                 pool = self._pool
                 generation = self._generation
                 excluded = set(exclude_ids or set())
+                allowed_node_ids = (
+                    None
+                    if allowed_ids is None
+                    else {str(node_id) for node_id in allowed_ids}
+                )
                 wanted = {str(tag).strip().lower() for tag in (node_tags or []) if str(tag).strip()}
                 allowed_records = [
                     record
                     for record in self._records
-                    if record.id not in excluded and (not wanted or wanted.intersection(record.tags))
+                    if record.id not in excluded
+                    and (allowed_node_ids is None or record.id in allowed_node_ids)
+                    and (not wanted or wanted.intersection(record.tags))
                 ]
                 self._pending_acquires[task_id] = threading.Event()
         if wait_event is not None:
@@ -648,9 +651,6 @@ class ProxyPoolAdapter:
                     record.cooldown_until = time.time() + self.settings.fail_cooldown_seconds
                 else:
                     record.success_count += 1
-                    record.healthy = True
-                    record.last_error = ""
-                    record.cooldown_until = 0.0
             pool = self._pool
         if forwarder is not None:
             forwarder.stop()

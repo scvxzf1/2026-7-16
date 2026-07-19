@@ -205,7 +205,24 @@ class Database:
             CREATE INDEX IF NOT EXISTS idx_crawl_address_tasks_address
                 ON crawl_address_tasks(address_id, sequence_no);
 
-            UPDATE meta SET value='2' WHERE key='schema_version';
+            CREATE TABLE IF NOT EXISTS crawl_address_proxy_probes (
+                address_id TEXT PRIMARY KEY REFERENCES crawl_addresses(id) ON DELETE CASCADE,
+                target_url TEXT NOT NULL,
+                total_count INTEGER NOT NULL,
+                healthy_count INTEGER NOT NULL,
+                checked_at REAL NOT NULL,
+                last_error TEXT NOT NULL DEFAULT ''
+            );
+
+            CREATE TABLE IF NOT EXISTS crawl_address_proxy_nodes (
+                address_id TEXT NOT NULL REFERENCES crawl_addresses(id) ON DELETE CASCADE,
+                node_id TEXT NOT NULL,
+                PRIMARY KEY(address_id, node_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_crawl_address_proxy_nodes_address
+                ON crawl_address_proxy_nodes(address_id);
+
+            UPDATE meta SET value='3' WHERE key='schema_version';
             """
         )
 
@@ -795,8 +812,14 @@ class Database:
                 return None
             rows = self._conn.execute(
                 """
-                SELECT * FROM crawl_addresses
-                WHERE batch_id=? ORDER BY source_order, address_order
+                SELECT ca.*, cap.target_url AS proxy_probe_target,
+                    cap.total_count AS probed_proxy_count,
+                    cap.healthy_count AS healthy_proxy_count,
+                    cap.checked_at AS proxy_probed_at,
+                    cap.last_error AS proxy_probe_error
+                FROM crawl_addresses ca
+                LEFT JOIN crawl_address_proxy_probes cap ON cap.address_id=ca.id
+                WHERE ca.batch_id=? ORDER BY ca.source_order, ca.address_order
                 """,
                 (batch_id,),
             ).fetchall()
@@ -881,6 +904,74 @@ class Database:
                 (batch_id,),
             ).fetchone()
             return self._crawl_address(row)
+
+    def save_crawl_address_proxy_probe(
+        self,
+        address_id: str,
+        *,
+        target_url: str,
+        total_count: int,
+        healthy_node_ids: list[str],
+        error: str = "",
+    ) -> dict[str, Any]:
+        checked_at = time.time()
+        node_ids = list(dict.fromkeys(str(value) for value in healthy_node_ids if str(value)))
+        with self._transaction() as conn:
+            address = conn.execute(
+                "SELECT id FROM crawl_addresses WHERE id=?",
+                (address_id,),
+            ).fetchone()
+            if address is None:
+                raise KeyError(address_id)
+            conn.execute(
+                """
+                INSERT INTO crawl_address_proxy_probes(
+                    address_id, target_url, total_count, healthy_count, checked_at, last_error
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(address_id) DO UPDATE SET
+                    target_url=excluded.target_url,
+                    total_count=excluded.total_count,
+                    healthy_count=excluded.healthy_count,
+                    checked_at=excluded.checked_at,
+                    last_error=excluded.last_error
+                """,
+                (
+                    address_id,
+                    target_url,
+                    max(0, int(total_count)),
+                    len(node_ids),
+                    checked_at,
+                    redact_text(error, limit=2000),
+                ),
+            )
+            conn.execute(
+                "DELETE FROM crawl_address_proxy_nodes WHERE address_id=?",
+                (address_id,),
+            )
+            conn.executemany(
+                "INSERT INTO crawl_address_proxy_nodes(address_id, node_id) VALUES (?, ?)",
+                ((address_id, node_id) for node_id in node_ids),
+            )
+        return self.get_crawl_address_proxy_probe(address_id)  # type: ignore[return-value]
+
+    def get_crawl_address_proxy_probe(self, address_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM crawl_address_proxy_probes WHERE address_id=?",
+                (address_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            node_rows = self._conn.execute(
+                """
+                SELECT node_id FROM crawl_address_proxy_nodes
+                WHERE address_id=? ORDER BY node_id
+                """,
+                (address_id,),
+            ).fetchall()
+        result = dict(row)
+        result["node_ids"] = [str(item["node_id"]) for item in node_rows]
+        return result
 
     def begin_crawl_address_planning(self, address_id: str) -> bool:
         now = time.time()

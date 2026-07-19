@@ -69,6 +69,20 @@ class ProxyCoreTests(unittest.TestCase):
         )
         self.assertEqual(endpoints[0].local_http, "http://127.0.0.1:29100")
 
+    def test_mieru_port_range_does_not_reintroduce_a_single_port(self):
+        nodes = parse_subscription_text(
+            "mieru://user:secret@range.example:5000"
+            "?transport=tcp&multiplexing=low&port-range=5000-5010#RANGE"
+        )
+        config, endpoints = build_transport_config(
+            nodes,
+            listen_host="127.0.0.1",
+            base_port=29100,
+        )
+        self.assertEqual(len(endpoints), 1)
+        self.assertEqual(config["proxies"][0]["port-range"], "5000-5010")
+        self.assertNotIn("port", config["proxies"][0])
+
     def test_adapter_wires_core_endpoints_into_native_pool(self):
         with tempfile.TemporaryDirectory() as tmp:
             settings = make_settings(Path(tmp))

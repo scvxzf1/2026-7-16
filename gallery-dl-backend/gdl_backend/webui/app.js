@@ -5,6 +5,13 @@ const $$ = (selector, root = document) => Array.from(root.querySelectorAll(selec
 
 const TERMINAL_BATCH = new Set(["succeeded", "completed_with_errors", "cancelled"]);
 const TERMINAL_TASK = new Set(["succeeded", "failed", "cancelled"]);
+const PIXIV_OAUTH_ACTIVE = new Set([
+  "starting",
+  "starting_browser",
+  "awaiting_login",
+  "awaiting_code",
+  "exchanging",
+]);
 const TASK_DISPLAY_LIMIT = 1000;
 const SITE_NAMES = {
   danbooru: "Danbooru",
@@ -81,6 +88,7 @@ const state = {
   sources: [],
   activeBatchId: sessionStorage.getItem("gdl.activeBatch") || "",
   activeBatch: null,
+  activeBatchTasks: [],
   pollTimer: null,
   refreshingBatchId: "",
   batchRequestToken: 0,
@@ -91,6 +99,7 @@ const state = {
   },
   auth: new Map(),
   pixivOAuthSessionId: "",
+  pixivOAuthPoller: null,
   browserLoginSessions: new Map(),
   browserLoginPollers: new Map(),
   authPromptedSites: new Set(),
@@ -186,20 +195,8 @@ function setPill(element, kind, text) {
   element.replaceChildren(dot, document.createTextNode(text));
 }
 
-function currentApiKey() {
-  return $("#apiKey").value.trim();
-}
-
-function saveApiKey() {
-  const value = currentApiKey();
-  if (value) sessionStorage.setItem("gdl.apiKey", value);
-  else sessionStorage.removeItem("gdl.apiKey");
-}
-
 async function api(path, options = {}) {
   const headers = new Headers(options.headers || {});
-  const key = currentApiKey();
-  if (key) headers.set("X-API-Key", key);
   if (options.body !== undefined && !headers.has("Content-Type")) {
     headers.set("Content-Type", "application/json");
   }
@@ -394,6 +391,51 @@ function scheduleBrowserLoginPoll(site, sessionId) {
   state.browserLoginPollers.set(site, timer);
 }
 
+function stopPixivOAuthPolling() {
+  if (state.pixivOAuthPoller) clearTimeout(state.pixivOAuthPoller);
+  state.pixivOAuthPoller = null;
+  state.pixivOAuthSessionId = "";
+}
+
+function schedulePixivOAuthPoll(sessionId) {
+  if (!sessionId) return;
+  if (state.pixivOAuthSessionId !== sessionId) stopPixivOAuthPolling();
+  state.pixivOAuthSessionId = sessionId;
+  if (state.pixivOAuthPoller) return;
+  state.pixivOAuthPoller = setTimeout(async () => {
+    state.pixivOAuthPoller = null;
+    if (state.pixivOAuthSessionId !== sessionId) return;
+    try {
+      const status = await api("/api/v1/auth/pixiv");
+      renderAuthStatus(status);
+      const oauth = status.oauth || null;
+      if (status.authorized && !oauth) {
+        state.pixivOAuthSessionId = "";
+        stopPixivOAuthPolling();
+        setAuthFeedback("pixiv", "登录成功，Token 已由后端自动保存。", "success");
+        appendLog("Pixiv 登录授权完成，回调已自动捕获并保存。", "success");
+        return;
+      }
+      if (oauth?.session_id === sessionId && PIXIV_OAUTH_ACTIVE.has(oauth.state)) {
+        schedulePixivOAuthPoll(sessionId);
+        return;
+      }
+      state.pixivOAuthSessionId = "";
+      stopPixivOAuthPolling();
+      if (oauth?.state !== "cancelled") {
+        const message = oauth?.error || oauth?.message || "Pixiv 登录流程已结束。";
+        setAuthFeedback("pixiv", message, "error");
+        appendLog(`Pixiv 登录授权：${message}`, "error");
+      }
+    } catch (error) {
+      state.pixivOAuthSessionId = "";
+      stopPixivOAuthPolling();
+      setAuthFeedback("pixiv", formatError(error), "error");
+      appendLog(`Pixiv 登录状态：${formatError(error)}`, "error");
+    }
+  }, 800);
+}
+
 function renderAuthStatus(status) {
   if (!status?.site) return;
   state.auth.set(status.site, status);
@@ -404,7 +446,7 @@ function renderAuthStatus(status) {
   card.classList.add(status.state || "public");
   $(".auth-state", card).textContent = AUTH_STATE_NAMES[status.state] || status.state || "未知";
   const details = [];
-  if (status.browser === "project_chrome") details.push("项目专属 Chrome");
+  if (status.browser === "project_chrome") details.push("共享授权 Chrome");
   const cookieInfo = status.cookies || status.browser_session;
   if (cookieInfo?.valid) details.push(`${cookieInfo.cookie_count || 0} 条托管 Cookie`);
   $(".auth-summary", card).textContent = [status.summary, ...details].filter(Boolean).join(" ");
@@ -420,11 +462,11 @@ function renderAuthStatus(status) {
       ? "等待窗口内登录…"
       : status.authorized
         ? "重新授权"
-        : "打开专属登录窗口";
+        : "在共享浏览器中授权";
   }
   if (cancelButton) cancelButton.classList.toggle("hidden", !loginActive);
   if (loginActive) {
-    setAuthFeedback(status.site, login.message || "请在项目专属浏览器窗口内完成登录。", "");
+    setAuthFeedback(status.site, login.message || "请在共享授权浏览器标签页内完成登录。", "");
     scheduleBrowserLoginPoll(status.site, login.session_id);
   } else if (status.invalidated_at) {
     setAuthFeedback(status.site, "当前凭证已在实际访问中失效，请重新授权。", "error");
@@ -437,8 +479,32 @@ function renderAuthStatus(status) {
   }
   if (status.site === "pixiv") {
     const button = $("#startPixivOAuth");
-    if (button) button.textContent = status.authorized ? "重新进行 Pixiv 授权" : "Pixiv 登录授权";
-    if (status.oauth?.session_id) state.pixivOAuthSessionId = status.oauth.session_id;
+    const cancel = $("#cancelPixivOAuth");
+    const oauth = status.oauth || null;
+    const active = Boolean(oauth?.session_id && PIXIV_OAUTH_ACTIVE.has(oauth.state));
+    if (button) {
+      button.disabled = active;
+      button.textContent = active
+        ? "等待共享浏览器登录…"
+        : status.authorized
+          ? "重新授权"
+          : "在共享浏览器中授权";
+    }
+    if (cancel) cancel.classList.toggle("hidden", !active);
+    if (active) {
+      setAuthFeedback("pixiv", oauth.message || "请在共享授权 Chrome 中完成 Pixiv 登录。", "");
+      schedulePixivOAuthPoll(oauth.session_id);
+    } else if (oauth?.state === "failed" || oauth?.state === "timed_out") {
+      stopPixivOAuthPolling();
+      setAuthFeedback("pixiv", oauth.error || oauth.message || "Pixiv 登录授权失败。", "error");
+    } else if (status.authorized) {
+      stopPixivOAuthPolling();
+      state.pixivOAuthSessionId = "";
+      setAuthFeedback("pixiv", "登录有效，Token 已由后端托管。", "success");
+    } else if (!status.authorized) {
+      stopPixivOAuthPolling();
+      setAuthFeedback("pixiv", "", "");
+    }
   }
 }
 
@@ -463,8 +529,8 @@ async function startManagedBrowserLogin(element, site) {
       renderAuthStatus(result.status);
       const session = result.session || {};
       if (session.session_id) scheduleBrowserLoginPoll(site, session.session_id);
-      setAuthFeedback(site, session.message || "项目专属登录窗口已打开。", "");
-      appendLog(`${SITE_NAMES[site]} 项目专属登录窗口已打开。`, "info");
+      setAuthFeedback(site, session.message || "共享授权浏览器标签页已打开。", "");
+      appendLog(`${SITE_NAMES[site]} 共享授权浏览器标签页已打开。`, "info");
     } catch (error) {
       setAuthFeedback(site, formatError(error), "error");
       appendLog(`${SITE_NAMES[site]} 登录窗口：${formatError(error)}`, "error");
@@ -484,7 +550,7 @@ async function cancelManagedBrowserLogin(element, site) {
       stopBrowserLoginPolling(site);
       state.browserLoginSessions.delete(site);
       renderAuthStatus(result.status);
-      setAuthFeedback(site, "登录窗口已关闭。", "");
+      setAuthFeedback(site, "授权标签页已关闭。", "");
     } catch (error) {
       setAuthFeedback(site, formatError(error), "error");
       appendLog(`${SITE_NAMES[site]} 关闭登录窗口：${formatError(error)}`, "error");
@@ -493,63 +559,33 @@ async function cancelManagedBrowserLogin(element, site) {
 }
 
 async function startPixivOAuth(element) {
-  const popup = window.open("about:blank", "gdl-pixiv-oauth");
-  await withBusy(element, "生成授权页…", async () => {
+  await withBusy(element, "打开共享浏览器…", async () => {
     try {
       const session = await api("/api/v1/auth/pixiv/oauth/start", { method: "POST" });
-      state.pixivOAuthSessionId = session.session_id;
-      const href = safeExternalUrl(session.authorization_url);
-      const link = $("#pixivAuthorizationLink");
-      link.href = href;
-      $("#pixivOAuthCallback").value = "";
-      $("#pixivOAuthPanel").classList.remove("hidden");
-      if (popup && href) popup.location.href = href;
-      else if (href) window.open(href, "_blank", "noopener");
-      appendLog("Pixiv 登录页已生成；登录后粘贴 callback URL 完成授权。", "info");
-      await refreshAuthStatus(true);
+      setAuthFeedback(
+        "pixiv",
+        session.message || "请在共享授权 Chrome 中完成 Pixiv 登录；回调会自动处理。",
+        "",
+      );
+      schedulePixivOAuthPoll(session.session_id);
+      appendLog("Pixiv 共享授权浏览器标签页已打开；授权回调将由后端自动捕获。", "info");
     } catch (error) {
-      if (popup) popup.close();
+      setAuthFeedback("pixiv", formatError(error), "error");
       appendLog(`启动 Pixiv 授权：${formatError(error)}`, "error");
     }
   });
-}
-
-async function completePixivOAuth(element) {
-  const callback = $("#pixivOAuthCallback").value.trim();
-  if (!callback) {
-    appendLog("请粘贴 Pixiv callback URL。", "error");
-    return;
-  }
-  if (!state.pixivOAuthSessionId) {
-    appendLog("Pixiv 授权会话已失效，请重新开始。", "error");
-    return;
-  }
-  await withBusy(element, "确认授权中…", async () => {
-    try {
-      const status = await api("/api/v1/auth/pixiv/oauth/complete", {
-        method: "POST",
-        body: { session_id: state.pixivOAuthSessionId, callback },
-      });
-      state.pixivOAuthSessionId = "";
-      renderAuthStatus(status);
-      $("#pixivOAuthPanel").classList.add("hidden");
-      $("#pixivOAuthCallback").value = "";
-      appendLog("Pixiv 登录授权完成，后续搜索和爬取会自动使用。", "success");
-    } catch (error) {
-      appendLog(`完成 Pixiv 授权：${formatError(error)}`, "error");
-    }
-  });
+  await refreshAuthStatus(true).catch(() => {});
 }
 
 async function cancelPixivOAuth(element) {
-  await withBusy(element, "取消中…", async () => {
+  await withBusy(element, "关闭中…", async () => {
     try {
       const status = await api("/api/v1/auth/pixiv/oauth/session", { method: "DELETE" });
+      stopPixivOAuthPolling();
       state.pixivOAuthSessionId = "";
-      $("#pixivOAuthPanel").classList.add("hidden");
-      $("#pixivOAuthCallback").value = "";
       renderAuthStatus(status);
-      appendLog("Pixiv 本次授权流程已取消，已有登录状态保持不变。", "info");
+      setAuthFeedback("pixiv", "Pixiv 授权标签页已关闭。", "");
+      appendLog("Pixiv 本次授权流程已关闭，已有登录状态保持不变。", "info");
     } catch (error) {
       appendLog(`取消 Pixiv 授权：${formatError(error)}`, "error");
     }
@@ -557,7 +593,7 @@ async function cancelPixivOAuth(element) {
 }
 
 async function clearAuth(element, site) {
-  if (!window.confirm(`清除 ${SITE_NAMES[site]} 的托管登录状态？`)) return;
+  if (!window.confirm(`删除 ${SITE_NAMES[site]} 的后端导出凭证？共享浏览器登录状态会继续保留。`)) return;
   await withBusy(element, "清除中…", async () => {
     try {
       const status = await api(`/api/v1/auth/${encodeURIComponent(site)}`, { method: "DELETE" });
@@ -566,35 +602,48 @@ async function clearAuth(element, site) {
       state.authPromptedSites.delete(site);
       renderAuthStatus(status);
       if (site === "pixiv") {
+        stopPixivOAuthPolling();
         state.pixivOAuthSessionId = "";
-        $("#pixivOAuthPanel").classList.add("hidden");
       }
-      appendLog(`${SITE_NAMES[site]} 托管登录状态已清除。`, "success");
+      appendLog(`${SITE_NAMES[site]} 后端导出凭证已删除；共享浏览器 Profile 保持原样。`, "success");
     } catch (error) {
       appendLog(`清除 ${SITE_NAMES[site]} 登录：${formatError(error)}`, "error");
     }
   });
 }
 
+async function clearAuthBrowserProfile(element) {
+  if (!window.confirm("清空 X、Pixiv、EH 共用的项目授权浏览器 Profile？后端已导出的凭证仍由各站点单独管理。")) return;
+  await withBusy(element, "清空中…", async () => {
+    try {
+      await api("/api/v1/auth/browser-profile", { method: "DELETE" });
+      stopPixivOAuthPolling();
+      state.browserLoginPollers.forEach((timer) => clearTimeout(timer));
+      state.browserLoginPollers.clear();
+      state.browserLoginSessions.clear();
+      await refreshAuthStatus(true);
+      appendLog("共享授权浏览器 Profile 已清空；后端导出凭证保持原样。", "success");
+    } catch (error) {
+      appendLog(`清空授权浏览器：${formatError(error)}`, "error");
+    }
+  });
+}
+
 async function checkConnection(logResult = true) {
-  saveApiKey();
   try {
     const health = await fetch("/healthz", { cache: "no-store" });
     if (!health.ok) throw new Error(`健康检查返回 ${health.status}`);
     await api("/api/v1/config");
     setPill($("#apiStatus"), "good", "API 已连接");
     await Promise.all([refreshProxyStatus(), refreshAuthStatus(true), loadRecentBatches(true)]);
-    if (logResult) appendLog("后端连接及 API Key 检测通过。", "success");
+    if (logResult) appendLog("后端连接检测通过。", "success");
   } catch (error) {
-    const kind = error.status === 401 ? "warn" : "bad";
-    const message = error.status === 401 ? "API Key 待填写" : "API 连接失败";
-    setPill($("#apiStatus"), kind, message);
+    setPill($("#apiStatus"), "bad", "API 连接失败");
     if (logResult) appendLog(formatError(error), "error");
   }
 }
 
 async function proxyAction(element, path, body, label) {
-  saveApiKey();
   await withBusy(element, "处理中…", async () => {
     try {
       const result = await api(path, { method: "POST", body });
@@ -637,7 +686,6 @@ function sourceAddressState(source) {
 
 async function runSearch(event) {
   event.preventDefault();
-  saveApiKey();
   let request;
   try {
     request = searchPayload();
@@ -852,6 +900,15 @@ function renderSearchResults() {
     card.append(meta);
     if (data.error) card.append(node("p", "source-error", data.error.message || String(data.error)));
 
+    const searchHref = safeExternalUrl(data.search_url);
+    if (searchHref) {
+      const searchLink = node("a", "source-search-link", "打开该来源的站内搜索结果");
+      searchLink.href = searchHref;
+      searchLink.target = "_blank";
+      searchLink.rel = "noreferrer";
+      card.append(searchLink);
+    }
+
     const list = node("div", "address-list");
     if (!visibleAddresses.length) {
       const message = source.site === "exhentai" && ehTagFilterActive()
@@ -897,8 +954,16 @@ function renderSearchResults() {
           confidenceLabel,
         ),
       );
-      const url = node("code", "address-url", address.url || "");
+      const href = safeExternalUrl(address.url);
+      const url = href
+        ? node("a", "address-url", address.url || "")
+        : node("code", "address-url", address.url || "");
       url.title = address.url || "";
+      if (href) {
+        url.href = href;
+        url.target = "_blank";
+        url.rel = "noreferrer";
+      }
       const chips = node("div", "address-meta");
       if (address.matched_items !== undefined) chips.append(chip(`匹配 ${address.matched_items}`));
       if (address.media_count) chips.append(chip(`媒体 ${address.media_count}`));
@@ -1041,7 +1106,6 @@ function idempotencyKey() {
 }
 
 async function startCrawl() {
-  saveApiKey();
   let payload;
   try {
     payload = buildCrawlPayload();
@@ -1058,6 +1122,8 @@ async function startCrawl() {
       });
       state.activeBatchId = batch.id;
       state.activeBatch = batch;
+      state.activeBatchTasks = [];
+      state.lastPollError = "";
       sessionStorage.setItem("gdl.activeBatch", batch.id);
       appendLog(`顺序批次 ${shortId(batch.id)} 已创建。`, "success");
       renderBatch(batch, []);
@@ -1138,6 +1204,7 @@ async function refreshActiveBatch() {
     state.activeBatch = batch;
     state.lastPollError = "";
     const tasks = taskPage.items || [];
+    state.activeBatchTasks = tasks;
     renderBatch(batch, tasks);
     await promptTaskAuthFailures(tasks);
     if (TERMINAL_BATCH.has(batch.status)) {
@@ -1149,6 +1216,9 @@ async function refreshActiveBatch() {
     const message = formatError(error);
     if (message !== state.lastPollError) appendLog(`刷新批次：${message}`, "error");
     state.lastPollError = message;
+    if (state.activeBatch?.id === batchId) {
+      renderBatch(state.activeBatch, state.activeBatchTasks);
+    }
   } finally {
     if (requestToken === state.batchRequestToken && state.refreshingBatchId === batchId) {
       state.refreshingBatchId = "";
@@ -1166,9 +1236,10 @@ function stat(label, value, title = "") {
 }
 
 function renderBatch(batch, tasks) {
+  const pollError = state.lastPollError;
   $("#emptyBatch").classList.add("hidden");
   $("#batchView").classList.remove("hidden");
-  $("#cancelBatch").disabled = TERMINAL_BATCH.has(batch.status);
+  $("#cancelBatch").disabled = Boolean(pollError) || TERMINAL_BATCH.has(batch.status);
   $("#rawBatchResponse").textContent = pretty({ batch, tasks });
   const current = batch.current;
   const terminalCount = Number(batch.succeeded_task_count || 0)
@@ -1179,14 +1250,16 @@ function renderBatch(batch, tasks) {
   $("#batchProgress").style.width = `${percent}%`;
 
   const header = $("#batchHeader");
-  header.replaceChildren(
-    stat("批次状态", STATUS_NAMES[batch.status] || batch.status),
+  const headerStats = [
+    stat(pollError ? "最后确认状态" : "批次状态", STATUS_NAMES[batch.status] || batch.status),
     stat("批次 ID", shortId(batch.id), batch.id),
     stat("当前地址", current ? `${SITE_NAMES[current.site] || current.site} · ${STATUS_NAMES[current.status] || current.status}` : "—"),
     stat("图片任务", `${terminalCount} / ${taskCount}`),
     stat("成功 / 失败 / 取消", `${batch.succeeded_task_count || 0} / ${batch.failed_task_count || 0} / ${batch.cancelled_task_count || 0}`),
     stat("图片并发", batch.concurrency ?? "—"),
-  );
+  ];
+  if (pollError) headerStats.unshift(stat("连接状态", "状态刷新失败", pollError));
+  header.replaceChildren(...headerStats);
 
   const sourceRoot = $("#batchSources");
   sourceRoot.replaceChildren();
@@ -1207,10 +1280,20 @@ function renderBatch(batch, tasks) {
       );
       const url = node("code", "", address.label || address.url);
       url.title = address.url;
+      const countParts = [
+        `任务 ${address.planned_task_count || 0}`,
+        `成功 ${address.succeeded_task_count || 0}`,
+        `失败 ${address.failed_task_count || 0}`,
+      ];
+      if (address.proxy_probed_at) {
+        countParts.push(
+          `代理 ${address.healthy_proxy_count || 0}/${address.probed_proxy_count || 0} 可用`,
+        );
+      }
       const counts = node(
         "span",
         "muted",
-        `任务 ${address.planned_task_count || 0} · 成功 ${address.succeeded_task_count || 0} · 失败 ${address.failed_task_count || 0}`,
+        countParts.join(" · "),
       );
       row.append(url, counts);
       group.append(row);
@@ -1267,6 +1350,7 @@ async function cancelActiveBatch() {
         body: {},
       });
       state.activeBatch = batch;
+      state.lastPollError = "";
       appendLog(`批次 ${shortId(batch.id)} 已进入取消流程。`, "success");
       await refreshActiveBatch();
       await loadRecentBatches(true);
@@ -1283,6 +1367,9 @@ function bindEvents() {
   $("#refreshAuth").addEventListener("click", (event) => {
     withBusy(event.currentTarget, "刷新中…", () => refreshAuthStatus(false));
   });
+  $("#clearAuthBrowserProfile").addEventListener("click", (event) => {
+    clearAuthBrowserProfile(event.currentTarget);
+  });
   $$('[data-managed-browser-auth]').forEach((element) => {
     element.addEventListener("click", () => startManagedBrowserLogin(element, element.dataset.managedBrowserAuth));
   });
@@ -1293,9 +1380,7 @@ function bindEvents() {
     element.addEventListener("click", () => clearAuth(element, element.dataset.authClear));
   });
   $("#startPixivOAuth").addEventListener("click", (event) => startPixivOAuth(event.currentTarget));
-  $("#completePixivOAuth").addEventListener("click", (event) => completePixivOAuth(event.currentTarget));
   $("#cancelPixivOAuth").addEventListener("click", (event) => cancelPixivOAuth(event.currentTarget));
-  $("#apiKey").addEventListener("change", saveApiKey);
   $("#searchForm").addEventListener("submit", runSearch);
   $("#selectAll").addEventListener("click", () => {
     const showWeak = weakEvidenceVisible();
@@ -1333,6 +1418,9 @@ function bindEvents() {
     const selected = $("#recentBatches").value;
     if (!selected) return appendLog("请选择一个最近批次。", "info");
     state.activeBatchId = selected;
+    state.activeBatch = null;
+    state.activeBatchTasks = [];
+    state.lastPollError = "";
     sessionStorage.setItem("gdl.activeBatch", selected);
     await refreshActiveBatch();
     syncPolling();
@@ -1356,7 +1444,6 @@ function bindEvents() {
 }
 
 async function boot() {
-  $("#apiKey").value = sessionStorage.getItem("gdl.apiKey") || "";
   bindEvents();
   appendLog("测试界面已载入。", "info");
   await checkConnection(false);

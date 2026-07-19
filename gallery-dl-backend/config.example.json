@@ -14,7 +14,6 @@
   "server": {
     "host": "127.0.0.1",
     "port": 8787,
-    "api_key": "",
     "cors_origins": [],
     "allow_private_targets": false
   },
@@ -41,9 +40,8 @@
     "node_file": "",
     "inline_nodes": [],
     "allow_socks": true,
-    "max_nodes": 50,
     "probe_url": "https://example.com/",
-    "probe_timeout_seconds": 5,
+    "probe_timeout_seconds": 10,
     "probe_workers": 32,
     "health_interval_seconds": 60,
     "fail_cooldown_seconds": 30,
