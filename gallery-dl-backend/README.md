@@ -7,6 +7,19 @@
 
 后端代码位于独立目录，gallery-dl 的更新与本后端互不覆盖。
 
+## 平台支持
+
+当前版本的平台支持等级如下：
+
+| 平台 | 支持等级 | 说明 |
+| --- | --- | --- |
+| Windows | 完整支持 | 当前主要开发与端到端验证平台；仓库附带 Windows 版 Mihomo compatible `bin/proxy-core.exe`，并提供 `run_backend.ps1`。 |
+| Linux | 兼容预览 | 后端 API、SQLite、POSIX 文件权限和子进程组管理已有实现。代理隧道功能需要自行安装 Mihomo compatible 核心，并在配置中填写二进制路径和 SHA-256；完整端到端回归仍待补齐。 |
+| macOS | 兼容预览 | 具备与 Linux 相同的 POSIX 基础实现，也需要自行配置代理核心和 Chrome 路径。当前陈旧进程识别仍依赖 Linux `/proc`，重启后的孤儿任务清理尚待适配。 |
+
+因此，当前对外支持等级为：**Windows 完整支持，Linux/macOS 兼容预览**。README
+中的部署命令以 PowerShell 为主，也是因为当前正式交付和验证环境为 Windows。
+
 ## 已实现能力
 
 - SQLite/WAL 任务、尝试、事件、日志、代理租约和站点策略持久化；
