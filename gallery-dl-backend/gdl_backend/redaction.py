@@ -5,7 +5,8 @@ from typing import Any, Iterable
 
 
 _URL_USERINFO = re.compile(
-    r"(?P<scheme>\b(?:https?|socks5?|vless|trojan|hysteria2|hy2|anytls)://)"
+    r"(?P<scheme>\b(?:https?|socks4|socks5h?|ss|ssr|vmess|vless|trojan|"
+    r"hysteria|hysteria2|hy2|tuic|anytls|mieru)://)"
     r"(?P<userinfo>[^\s/@]+(?::[^\s/@]*)?)@",
     re.IGNORECASE,
 )

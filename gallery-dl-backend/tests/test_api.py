@@ -17,21 +17,19 @@ class ApiTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.settings = make_settings(Path(self.temp.name))
-        self.settings.server.api_key = "test-key"
         self.container = ServiceContainer(self.settings)
         self.app = create_app(self.settings, container=self.container, start_background=False)
         self.client_context = TestClient(self.app)
         self.client = self.client_context.__enter__()
-        self.headers = {"X-API-Key": "test-key"}
+        self.headers = {}
 
     def tearDown(self):
         self.client_context.__exit__(None, None, None)
         self.temp.cleanup()
 
-    def test_health_and_auth(self):
+    def test_health_and_local_api(self):
         self.assertEqual(self.client.get("/healthz").status_code, 200)
-        self.assertEqual(self.client.get("/api/v1/tasks").status_code, 401)
-        self.assertEqual(self.client.get("/api/v1/tasks", headers=self.headers).status_code, 200)
+        self.assertEqual(self.client.get("/api/v1/tasks").status_code, 200)
 
     def test_webui_static_assets_and_root_link(self):
         root = self.client.get("/")
@@ -48,6 +46,12 @@ class ApiTests(unittest.TestCase):
         self.assertIn('data-managed-browser-auth="exhentai"', index.text)
         self.assertIn('id="startPixivOAuth"', index.text)
         self.assertIn('id="cancelPixivOAuth"', index.text)
+        self.assertIn('id="clearAuthBrowserProfile"', index.text)
+        self.assertIn("删除导出凭证", index.text)
+        self.assertIn("X、Pixiv 与 EH 共用同一个项目授权 Chrome Profile", index.text)
+        self.assertNotIn('id="apiKey"', index.text)
+        self.assertNotIn('id="pixivOAuthCallback"', index.text)
+        self.assertNotIn('id="completePixivOAuth"', index.text)
         self.assertNotIn('id="authBrowser"', index.text)
         self.assertNotIn('data-browser-auth=', index.text)
         self.assertNotIn("Cookie 文件</span><span>gallery-dl 配置", index.text)
@@ -57,6 +61,8 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(script.status_code, 200)
         self.assertIn("/api/v1/search", script.text)
         self.assertIn("/api/v1/crawls", script.text)
+        self.assertNotIn("X-API-Key", script.text)
+        self.assertNotIn("gdl.apiKey", script.text)
         self.assertIn("address-thumbnail", script.text)
         self.assertIn("gallery-tags", script.text)
         self.assertIn("ehEntryMatchesTagFilter", script.text)
@@ -66,7 +72,9 @@ class ApiTests(unittest.TestCase):
         self.assertIn("startManagedBrowserLogin", script.text)
         self.assertIn("scheduleBrowserLoginPoll", script.text)
         self.assertNotIn("importBrowserLogin", script.text)
-        self.assertIn("completePixivOAuth", script.text)
+        self.assertIn("schedulePixivOAuthPoll", script.text)
+        self.assertIn("/api/v1/auth/browser-profile", script.text)
+        self.assertNotIn("completePixivOAuth", script.text)
 
         styles = self.client.get("/ui/styles.css")
         self.assertEqual(styles.status_code, 200)
@@ -79,14 +87,14 @@ class ApiTests(unittest.TestCase):
         self.assertIn(".oauth-panel", styles.text)
 
     def test_managed_auth_api_contract(self):
-        self.assertEqual(self.client.get("/api/v1/auth").status_code, 401)
-        listing = self.client.get("/api/v1/auth", headers=self.headers)
+        listing = self.client.get("/api/v1/auth")
         self.assertEqual(listing.status_code, 200, listing.text)
         self.assertEqual(
             [item["site"] for item in listing.json()["items"]],
             ["danbooru", "twitter", "pixiv", "exhentai"],
         )
         self.assertFalse(listing.json()["secrets_exposed"])
+        self.assertTrue(listing.json()["browser_profile"]["shared"])
         unknown = self.client.get("/api/v1/auth/unknown", headers=self.headers)
         self.assertEqual(unknown.status_code, 404)
 
@@ -162,16 +170,15 @@ class ApiTests(unittest.TestCase):
             "summary": "Pixiv 登录授权有效。",
             "actions": ["oauth", "clear"],
         }
-        self.container.auth.complete_pixiv_oauth = AsyncMock(return_value=pixiv_status)
         completed = self.client.post(
             "/api/v1/auth/pixiv/oauth/complete",
             headers=self.headers,
             json={"session_id": "a" * 32, "callback": "https://callback/?code=VALUE"},
         )
-        self.assertEqual(completed.status_code, 200, completed.text)
-        self.assertTrue(completed.json()["authorized"])
-        self.container.auth.complete_pixiv_oauth.assert_awaited_once_with(
-            "a" * 32, "https://callback/?code=VALUE"
+        self.assertEqual(completed.status_code, 404, completed.text)
+        self.assertNotIn(
+            "/api/v1/auth/pixiv/oauth/complete",
+            self.client.get("/openapi.json").json()["paths"],
         )
 
         self.container.auth.cancel_pixiv_oauth = AsyncMock(return_value=pixiv_status)
@@ -185,6 +192,18 @@ class ApiTests(unittest.TestCase):
         self.container.auth.clear = AsyncMock(return_value={**pixiv_status, "authorized": False})
         cleared = self.client.delete("/api/v1/auth/pixiv", headers=self.headers)
         self.assertEqual(cleared.status_code, 200, cleared.text)
+
+        profile_result = {
+            "browser_profile": {"shared": True, "present": False, "running": False},
+            "auth": {"items": []},
+        }
+        self.container.auth.clear_browser_profile = AsyncMock(return_value=profile_result)
+        profile_cleared = self.client.delete(
+            "/api/v1/auth/browser-profile",
+            headers=self.headers,
+        )
+        self.assertEqual(profile_cleared.status_code, 200, profile_cleared.text)
+        self.container.auth.clear_browser_profile.assert_awaited_once()
 
     def test_task_idempotency_cancel_logs_and_files(self):
         body = {"url": "https://www.pixiv.net/artworks/123456", "proxy_mode": "direct"}
@@ -265,10 +284,9 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 422, response.text)
         self.assertEqual(response.json()["error"]["code"], "invalid_task")
 
-    def test_non_loopback_bind_requires_api_key(self):
+    def test_non_loopback_bind_is_rejected(self):
         self.settings.server.host = "0.0.0.0"
-        self.settings.server.api_key = ""
-        with self.assertRaises(ValueError):
+        with self.assertRaisesRegex(ValueError, "回环"):
             self.settings.validate()
 
     def test_search_sites_and_grouped_source_addresses(self):
@@ -331,6 +349,9 @@ class ApiTests(unittest.TestCase):
             "attempts": 1,
         }
         self.container.discovery.search = AsyncMock(return_value=expected)
+        self.container.discovery.search_danbooru_artists = AsyncMock(
+            return_value={"authors": []}
+        )
         response = self.client.post(
             "/api/v1/search",
             headers=self.headers,
@@ -344,15 +365,18 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         payload = response.json()
         self.assertEqual(payload["source_count"], 1)
-        self.assertEqual(payload["address_count"], 1)
+        self.assertEqual(payload["address_count"], 0)
         self.assertEqual(payload["weak_evidence_count"], 0)
         self.assertEqual(payload["sources"][0]["site"], "twitter")
-        self.assertEqual(payload["sources"][0]["addresses"][0]["url"], "https://x.com/artist/media")
-        self.assertEqual(payload["sources"][0]["addresses"][0]["confidence"], "verified")
+        self.assertEqual(payload["sources"][0]["addresses"], [])
+        self.assertEqual(
+            payload["sources"][0]["search_strategy"],
+            "danbooru_artist_urls",
+        )
         self.assertEqual(payload["sources"][0]["weak_evidence"], [])
         self.assertEqual(payload["selection_contract"]["execution_order"], "source_then_address")
         self.assertEqual(payload["selection_contract"]["default_visibility"], "addresses_only")
-        self.assertEqual(self.container.discovery.search.await_args.kwargs["site"], "twitter")
+        self.assertEqual(self.container.discovery.search.await_args.kwargs["site"], "danbooru")
 
     def test_exhentai_search_returns_selectable_galleries_with_previews(self):
         raw = {
@@ -633,29 +657,19 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(sources["pixiv"]["addresses"][0]["url"], "https://www.pixiv.net/users/77/artworks")
         self.assertEqual(sources["twitter"]["addresses"][0]["origin"], "danbooru_artist_url")
         self.assertEqual(sources["pixiv"]["addresses"][0]["confidence"], "verified")
-        self.assertEqual(
-            sources["pixiv"]["addresses"][0]["origins"],
-            ["site_search", "danbooru_artist_url"],
-        )
+        self.assertEqual(sources["pixiv"]["addresses"][0]["origin"], "danbooru_artist_url")
         self.assertIn(
             "danbooru_artist_url",
             sources["pixiv"]["addresses"][0]["evidence_reasons"],
         )
-        self.assertEqual(sources["pixiv"]["weak_evidence_count"], 1)
-        self.assertEqual(
-            sources["pixiv"]["weak_evidence"][0]["url"],
-            "https://www.pixiv.net/users/999/artworks",
-        )
-        self.assertEqual(
-            sources["pixiv"]["weak_evidence"][0]["confidence"], "weak_evidence"
-        )
-        self.assertNotIn(
-            "https://www.pixiv.net/users/999/artworks",
-            {item["url"] for item in sources["pixiv"]["addresses"]},
-        )
+        self.assertEqual(sources["pixiv"]["weak_evidence_count"], 0)
         self.assertEqual(len(sources["twitter"]["addresses"]), 2)
-        self.assertEqual(response.json()["weak_evidence_count"], 1)
+        self.assertEqual(response.json()["weak_evidence_count"], 0)
         self.assertEqual(len(response.json()["related_profiles"]), 3)
+        searched_sites = [call.kwargs["site"] for call in self.container.discovery.search.await_args_list]
+        self.assertEqual(searched_sites, ["danbooru"])
+        self.assertEqual(sources["twitter"]["search_strategy"], "danbooru_artist_urls")
+        self.assertEqual(sources["pixiv"]["search_strategy"], "danbooru_artist_urls")
 
     def test_cross_source_search_preserves_order_when_one_source_fails(self):
         async def search_side_effect(*, site, keyword, **kwargs):
@@ -684,8 +698,12 @@ class ApiTests(unittest.TestCase):
             [source["site"] for source in response.json()["sources"]],
             ["pixiv", "twitter"],
         )
-        self.assertEqual(response.json()["sources"][0]["status"], "failed")
+        self.assertEqual(response.json()["sources"][0]["status"], "succeeded")
         self.assertEqual(response.json()["sources"][1]["status"], "succeeded")
+        self.assertEqual(
+            [call.kwargs["site"] for call in self.container.discovery.search.await_args_list],
+            ["danbooru"],
+        )
 
     def test_ordered_crawl_sequence_and_batch_idempotency(self):
         async def discover_side_effect(*, site, url, **kwargs):
@@ -696,19 +714,28 @@ class ApiTests(unittest.TestCase):
                 if site == "twitter"
                 else f"https://www.pixiv.net/artworks/{work_id}"
             )
-            return {
-                "candidates": [
-                    {
-                        "id": work_id,
-                        "site": site,
-                        "kind": "work",
-                        "url": work_url,
-                        "media_count": count,
-                    }
-                ]
+            candidate = {
+                "id": work_id,
+                "site": site,
+                "kind": "work",
+                "url": work_url,
+                "media_count": count,
             }
+            if site == "twitter":
+                candidate["media_urls"] = [
+                    f"https://pbs.twimg.com/media/sample-{work_id}-{index}?format=jpg&name=orig"
+                    for index in range(1, count + 1)
+                ]
+            return {"candidates": [candidate]}
 
         self.container.discovery.discover_url = AsyncMock(side_effect=discover_side_effect)
+        cookie_path = self.container.auth.managed_dir / "twitter.cookies.txt"
+        cookie_path.write_text(
+            "# Netscape HTTP Cookie File\n\n"
+            ".x.com\tTRUE\t/\tTRUE\t4102444800\tauth_token\tSECRET\n"
+            ".x.com\tTRUE\t/\tTRUE\t4102444800\tct0\tSECRET2\n",
+            encoding="utf-8",
+        )
         body = {
             "sources": [
                 {
@@ -753,6 +780,15 @@ class ApiTests(unittest.TestCase):
         tasks = self.container.db.list_crawl_tasks(batch_id)
         self.assertEqual(len(tasks), 2)
         self.assertTrue(all(task["address_order"] == 0 for task in tasks))
+        self.assertEqual(
+            [task["url"] for task in tasks],
+            [
+                "https://pbs.twimg.com/media/sample-1-1?format=jpg&name=orig",
+                "https://pbs.twimg.com/media/sample-1-2?format=jpg&name=orig",
+            ],
+        )
+        self.assertTrue(all(task["cookies_file"] is None for task in tasks))
+        self.assertTrue(all("--range" not in task["extra_args"] for task in tasks))
         self.assertEqual(tasks[0]["policy"]["max_concurrency"], 20)
         self.assertEqual(
             tasks[0]["extra_args"][:4],
@@ -781,6 +817,127 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(progressed["sources"][0]["addresses"][1]["status"], "running")
         self.assertEqual(progressed["sources"][1]["addresses"][0]["status"], "pending")
         self.assertEqual(len(self.container.db.list_crawl_tasks(batch_id)), 3)
+
+    def test_ordered_crawl_probes_each_new_address_for_its_site(self):
+        import asyncio
+
+        events: list[tuple[str, str]] = []
+
+        def probe(*, target_url, **_kwargs):
+            events.append(("probe", target_url))
+            return {
+                "total": 3,
+                "healthy": 2,
+                "target": target_url,
+                "results": [
+                    {"id": "node-a", "healthy": True},
+                    {"id": "node-b", "healthy": True},
+                    {"id": "node-c", "healthy": False},
+                ],
+            }
+
+        async def discover(*, site, url, **_kwargs):
+            events.append(("discover", site))
+            work_url = (
+                "https://x.com/example/status/1"
+                if site == "twitter"
+                else "https://www.pixiv.net/artworks/2"
+            )
+            return {
+                "candidates": [
+                    {
+                        "id": site,
+                        "site": site,
+                        "kind": "work",
+                        "url": work_url,
+                        "media_count": 1,
+                    }
+                ]
+            }
+
+        self.container.proxy.probe = Mock(side_effect=probe)
+        self.container.discovery.discover_url = AsyncMock(side_effect=discover)
+        response = self.client.post(
+            "/api/v1/crawls",
+            headers=self.headers,
+            json={
+                "sources": [
+                    {
+                        "site": "x",
+                        "addresses": [{"url": "https://x.com/artist/media"}],
+                    },
+                    {
+                        "site": "pixiv",
+                        "addresses": [
+                            {"url": "https://www.pixiv.net/users/77/artworks"}
+                        ],
+                    },
+                ],
+                "proxy_mode": "required",
+            },
+        )
+        self.assertEqual(response.status_code, 202, response.text)
+        batch_id = response.json()["id"]
+
+        asyncio.run(self.container.ordered_crawls.run_once())
+        batch = self.container.db.get_crawl_batch(batch_id)
+        first_address = batch["sources"][0]["addresses"][0]
+        self.assertEqual(events, [("probe", "https://x.com/"), ("discover", "twitter")])
+        self.assertEqual(first_address["healthy_proxy_count"], 2)
+        self.assertEqual(first_address["probed_proxy_count"], 3)
+        first_task = self.container.db.list_crawl_tasks(batch_id)[0]
+        self.assertEqual(first_task["policy"]["proxy_probe_scope"], first_address["id"])
+        self.assertEqual(first_task["policy"]["probe_url"], "https://x.com/")
+        self.assertNotIn("allowed_proxy_ids", first_task["policy"])
+        self.assertEqual(
+            self.container.db.get_crawl_address_proxy_probe(first_address["id"])["node_ids"],
+            ["node-a", "node-b"],
+        )
+
+        self.container.db.complete_task(first_task["id"], "succeeded")
+        asyncio.run(self.container.ordered_crawls.run_once())
+        asyncio.run(self.container.ordered_crawls.run_once())
+        self.assertEqual(
+            events,
+            [
+                ("probe", "https://x.com/"),
+                ("discover", "twitter"),
+                ("probe", "https://www.pixiv.net/"),
+                ("discover", "pixiv"),
+            ],
+        )
+
+    def test_required_crawl_stops_before_planning_when_site_probe_has_no_nodes(self):
+        import asyncio
+
+        self.container.proxy.probe = Mock(
+            return_value={"total": 2, "healthy": 0, "results": []}
+        )
+        self.container.discovery.discover_url = AsyncMock()
+        response = self.client.post(
+            "/api/v1/crawls",
+            headers=self.headers,
+            json={
+                "sources": [
+                    {
+                        "site": "x",
+                        "addresses": [{"url": "https://x.com/artist/media"}],
+                    }
+                ],
+                "proxy_mode": "required",
+            },
+        )
+        batch_id = response.json()["id"]
+
+        asyncio.run(self.container.ordered_crawls.run_once())
+        batch = self.container.db.get_crawl_batch(batch_id)
+        address = batch["sources"][0]["addresses"][0]
+        self.assertEqual(address["status"], "failed")
+        self.assertEqual(address["healthy_proxy_count"], 0)
+        self.assertEqual(address["probed_proxy_count"], 2)
+        self.assertIn("图站探活后没有可用代理节点", address["last_error"])
+        self.assertEqual(batch["task_count"], 0)
+        self.container.discovery.discover_url.assert_not_awaited()
 
     def test_crawl_contract_rejects_legacy_modes_and_non_gallery_eh_address(self):
         legacy = self.client.post(

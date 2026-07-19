@@ -134,7 +134,27 @@ class CrawlPlanner:
                     planner_proxies.append(proxy_info)
             else:
                 count = max(1, int(item.get("media_count") or 1))
-                if count == 1:
+                media_urls: list[str] = []
+                if site == "twitter" and isinstance(item.get("media_urls"), list):
+                    media_urls = list(
+                        dict.fromkeys(
+                            str(value).strip()
+                            for value in item["media_urls"]
+                            if str(value).strip()
+                        )
+                    )
+                if media_urls and len(media_urls) >= count:
+                    for index, media_url in enumerate(media_urls[:count], start=1):
+                        units.append(
+                            CrawlUnit(
+                                media_url,
+                                site,
+                                "media",
+                                f"{source_id}:{index}",
+                                list(item_args),
+                            )
+                        )
+                elif count == 1:
                     units.append(CrawlUnit(url, site, kind, source_id, item_args))
                 else:
                     for index in range(1, count + 1):
@@ -186,6 +206,7 @@ class CrawlPlanner:
                             lease_id,
                             node_tags=policy.node_tags,
                             exclude_ids=tried,
+                            allowed_ids=getattr(policy, "allowed_proxy_ids", None),
                             probe_before_use=policy.probe_before_use,
                             probe_url=policy.probe_url,
                         )

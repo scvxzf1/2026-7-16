@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import hmac
 import ipaddress
 import re
 import socket
@@ -41,7 +40,6 @@ from .redaction import redact_text
 from .scheduler import TaskScheduler
 from .schemas import (
     CrawlRequest,
-    PixivOAuthCompleteRequest,
     ProxyProbeRequest,
     ProxyStartRequest,
     ProxyStopRequest,
@@ -96,6 +94,7 @@ class ServiceContainer:
             self.discovery,
             self.crawl_planner,
             self.scheduler,
+            self.proxy,
             self.policy_for,
             poll_interval=settings.scheduler.poll_interval_seconds,
         )
@@ -306,15 +305,10 @@ def create_app(
             },
         )
 
-    async def require_api_key(x_api_key: str | None = Header(default=None, alias="X-API-Key")) -> None:
-        expected = settings.server.api_key
-        if expected and not hmac.compare_digest(x_api_key or "", expected):
-            raise ApiError(401, "invalid_api_key", "API Key 校验失败")
-
     def get_service(request: Request) -> ServiceContainer:
         return request.app.state.container
 
-    api = APIRouter(prefix="/api/v1", dependencies=[Depends(require_api_key)])
+    api = APIRouter(prefix="/api/v1")
 
     @app.get("/")
     async def root():
@@ -412,19 +406,18 @@ def create_app(
         except AuthError as exc:
             _raise_auth_error(exc)
 
-    @api.post("/auth/pixiv/oauth/complete")
-    async def auth_complete_pixiv(
-        body: PixivOAuthCompleteRequest,
-        container: ServiceContainer = Depends(get_service),
-    ):
-        try:
-            return await container.auth.complete_pixiv_oauth(body.session_id, body.callback)
-        except AuthError as exc:
-            _raise_auth_error(exc)
-
     @api.delete("/auth/pixiv/oauth/session")
     async def auth_cancel_pixiv(container: ServiceContainer = Depends(get_service)):
         return await container.auth.cancel_pixiv_oauth()
+
+    @api.delete("/auth/browser-profile")
+    async def auth_clear_browser_profile(
+        container: ServiceContainer = Depends(get_service),
+    ):
+        try:
+            return await container.auth.clear_browser_profile()
+        except AuthError as exc:
+            _raise_auth_error(exc)
 
     @api.delete("/auth/{site}")
     async def auth_clear(site: str, container: ServiceContainer = Depends(get_service)):
@@ -504,7 +497,7 @@ def create_app(
                     _validate_site_match(site, site_info.site)
             else:
                 site = site_info.site
-            policy = container.policy_for(site)
+            policy = body._policy_override or container.policy_for(site)
             if concurrency_override is not None:
                 effective = min(
                     int(concurrency_override),
@@ -513,13 +506,18 @@ def create_app(
                 policy = policy.model_copy(update={"max_concurrency": max(1, effective)})
             task_id = str(uuid.uuid4())
             output_dir = container.settings.task_output_dir(body.output_dir, task_id)
-            credentials_ref, cookies_value, config_value = _managed_request_credentials(
-                container,
-                site,
-                credentials_ref=body.credentials_ref,
-                cookies_file=body.cookies_file,
-                config_file=body.config_file,
-            )
+            if body._skip_managed_credentials:
+                credentials_ref = body.credentials_ref
+                cookies_value = body.cookies_file
+                config_value = body.config_file
+            else:
+                credentials_ref, cookies_value, config_value = _managed_request_credentials(
+                    container,
+                    site,
+                    credentials_ref=body.credentials_ref,
+                    cookies_file=body.cookies_file,
+                    config_file=body.config_file,
+                )
             cookies, config_file = _allowed_request_files(
                 container,
                 cookies_file=cookies_value,
@@ -614,13 +612,48 @@ def create_app(
                 canonical = search_site(value).site
                 if canonical not in sites:
                     sites.append(canonical)
-            options = {site: _effective_search_options(body, site) for site in sites}
+            execution_sites = list(sites)
+            implicit_danbooru = (
+                "danbooru" not in execution_sites
+                and any(site in {"twitter", "pixiv"} for site in execution_sites)
+            )
+            if implicit_danbooru:
+                execution_sites.insert(0, "danbooru")
+            options = {
+                site: _effective_search_options(body, site) for site in execution_sites
+            }
         except ValueError as exc:
             raise ApiError(422, "invalid_search", str(exc)) from exc
 
         async def run_source(order: int, site: str) -> dict[str, Any]:
             spec = search_site(site)
             option = options[site]
+            if site in {"twitter", "pixiv"}:
+                # Account discovery for X and Pixiv is intentionally sourced
+                # from Danbooru's curated artist URLs.  Their native site
+                # searches are work-oriented / unstable and create false
+                # negatives for account lookup.  Crawl/download support for
+                # the resulting account URLs remains unchanged.
+                return {
+                    "order": order,
+                    "site": site,
+                    "status": "succeeded",
+                    "search_url": None,
+                    "search_strategy": "danbooru_artist_urls",
+                    "evidence_count": 0,
+                    "preview_count": 0,
+                    "preview_missing_count": 0,
+                    "address_count": 0,
+                    "addresses": [],
+                    "weak_evidence_count": 0,
+                    "weak_evidence": [],
+                    "tag_facets": [],
+                    "proxy": None,
+                    "attempts": 0,
+                    "error": None,
+                    "enrichment_errors": [],
+                    "auth": container.auth.status(site),
+                }
             try:
                 search_url = spec.search_url(body.keyword)
                 await asyncio.to_thread(
@@ -801,7 +834,7 @@ def create_app(
 
         sources = list(
             await asyncio.gather(
-                *(run_source(order, site) for order, site in enumerate(sites))
+                *(run_source(order, site) for order, site in enumerate(execution_sites))
             )
         )
         source_by_site = {source["site"]: source for source in sources}
@@ -812,10 +845,10 @@ def create_app(
             for error in source.get("enrichment_errors") or []
         ]
         danbooru = source_by_site.get("danbooru")
-        if danbooru is not None and danbooru["addresses"]:
+        if danbooru is not None and (danbooru["addresses"] or danbooru["weak_evidence"]):
             artist_names = [
                 str(address.get("tag") or "")
-                for address in danbooru["addresses"]
+                for address in [*danbooru["addresses"], *danbooru["weak_evidence"]]
                 if address.get("address_type") == "artist_tag"
             ]
             if artist_names:
@@ -848,7 +881,7 @@ def create_app(
                     danbooru["status"] = "partial"
                     danbooru["enrichment_errors"] = danbooru_errors
                 profile_by_name = {str(profile["name"]): profile for profile in profiles}
-                for address in danbooru["addresses"]:
+                for address in [*danbooru["addresses"], *danbooru["weak_evidence"]]:
                     profile = profile_by_name.get(str(address.get("tag") or ""))
                     if profile is None:
                         continue
@@ -944,6 +977,11 @@ def create_app(
                 for source in sources:
                     source["address_count"] = len(source["addresses"])
                     source["weak_evidence_count"] = len(source["weak_evidence"])
+
+        if implicit_danbooru:
+            sources = [source for source in sources if source["site"] != "danbooru"]
+        for order, source in enumerate(sources):
+            source["order"] = order
 
         return {
             "keyword": body.keyword,

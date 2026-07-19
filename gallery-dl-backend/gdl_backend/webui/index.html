@@ -34,19 +34,12 @@
         <button id="checkConnection" class="button secondary" type="button">检测连接</button>
       </div>
 
-      <div class="connection-grid">
-        <label class="field grow">
-          <span>API Key</span>
-          <input id="apiKey" type="password" autocomplete="off" placeholder="未配置时留空">
-          <small>仅保存到当前标签页的 sessionStorage。</small>
-        </label>
-        <div class="proxy-summary" id="proxySummary">
-          <div><span>运行</span><strong>—</strong></div>
-          <div><span>节点</span><strong>—</strong></div>
-          <div><span>健康</span><strong>—</strong></div>
-          <div><span>租约</span><strong>—</strong></div>
-          <div><span>传输核心</span><strong>—</strong></div>
-        </div>
+      <div class="proxy-summary" id="proxySummary">
+        <div><span>运行</span><strong>—</strong></div>
+        <div><span>节点</span><strong>—</strong></div>
+        <div><span>健康</span><strong>—</strong></div>
+        <div><span>租约</span><strong>—</strong></div>
+        <div><span>传输核心</span><strong>—</strong></div>
       </div>
 
       <div class="button-row">
@@ -100,10 +93,11 @@
             <div>
               <p class="eyebrow">自动凭证</p>
               <h3 id="authCenterTitle">站点登录授权</h3>
-              <p class="muted">X 与 EH 使用项目专属 Chrome 登录窗口；登录一次后持久化复用，实际失效时再提示重新授权。</p>
+              <p class="muted">X、Pixiv 与 EH 共用同一个项目授权 Chrome Profile；单站清理只删除后端导出凭证。</p>
             </div>
             <div class="auth-toolbar">
               <button id="refreshAuth" class="button ghost compact" type="button">刷新授权状态</button>
+              <button id="clearAuthBrowserProfile" class="button danger-quiet compact" type="button">清空授权浏览器</button>
             </div>
           </div>
 
@@ -118,17 +112,19 @@
               <p class="auth-summary muted">检测项目专属浏览器登录状态…</p>
               <p class="auth-feedback hidden" aria-live="polite"></p>
               <div class="auth-actions">
-                <button class="button secondary compact" data-managed-browser-auth="twitter" type="button">打开专属登录窗口</button>
-                <button class="button ghost compact hidden" data-managed-browser-cancel="twitter" type="button">关闭登录窗口</button>
-                <button class="button danger-quiet compact hidden" data-auth-clear="twitter" type="button">退出托管登录</button>
+                <button class="button secondary compact" data-managed-browser-auth="twitter" type="button">在共享浏览器中授权</button>
+                <button class="button ghost compact hidden" data-managed-browser-cancel="twitter" type="button">关闭授权标签页</button>
+                <button class="button danger-quiet compact hidden" data-auth-clear="twitter" type="button">删除导出凭证</button>
               </div>
             </article>
             <article class="auth-card" data-auth-card="pixiv">
               <div class="auth-card-title"><strong>Pixiv</strong><span class="auth-state">检测中</span></div>
               <p class="auth-summary muted">检测 OAuth 登录授权…</p>
+              <p class="auth-feedback hidden" aria-live="polite"></p>
               <div class="auth-actions">
-                <button id="startPixivOAuth" class="button primary compact" type="button">Pixiv 登录授权</button>
-                <button class="button danger-quiet compact hidden" data-auth-clear="pixiv" type="button">退出托管登录</button>
+                <button id="startPixivOAuth" class="button secondary compact" type="button">在共享浏览器中授权</button>
+                <button id="cancelPixivOAuth" class="button ghost compact hidden" type="button">关闭授权标签页</button>
+                <button class="button danger-quiet compact hidden" data-auth-clear="pixiv" type="button">删除导出凭证</button>
               </div>
             </article>
             <article class="auth-card" data-auth-card="exhentai">
@@ -136,30 +132,13 @@
               <p class="auth-summary muted">检测项目专属浏览器登录状态…</p>
               <p class="auth-feedback hidden" aria-live="polite"></p>
               <div class="auth-actions">
-                <button class="button secondary compact" data-managed-browser-auth="exhentai" type="button">打开专属登录窗口</button>
-                <button class="button ghost compact hidden" data-managed-browser-cancel="exhentai" type="button">关闭登录窗口</button>
-                <button class="button danger-quiet compact hidden" data-auth-clear="exhentai" type="button">退出托管登录</button>
+                <button class="button secondary compact" data-managed-browser-auth="exhentai" type="button">在共享浏览器中授权</button>
+                <button class="button ghost compact hidden" data-managed-browser-cancel="exhentai" type="button">关闭授权标签页</button>
+                <button class="button danger-quiet compact hidden" data-auth-clear="exhentai" type="button">删除导出凭证</button>
               </div>
             </article>
           </div>
 
-          <div id="pixivOAuthPanel" class="oauth-panel hidden" aria-labelledby="pixivOAuthTitle">
-            <h4 id="pixivOAuthTitle">完成 Pixiv 登录授权</h4>
-            <ol>
-              <li>打开登录页并完成 Pixiv 登录。</li>
-              <li>在浏览器开发者工具的 Network 中选择最后一个 <code>callback?state=…</code> 请求。</li>
-              <li>复制该请求 URL，粘贴到下方后确认；Token 会由后端保存。</li>
-            </ol>
-            <div class="oauth-controls">
-              <a id="pixivAuthorizationLink" class="button primary" target="_blank" rel="noreferrer">打开 Pixiv 登录页</a>
-              <label class="field grow">
-                <span>授权回调 URL</span>
-                <input id="pixivOAuthCallback" type="text" autocomplete="off" placeholder="粘贴 callback URL 或 code">
-              </label>
-              <button id="completePixivOAuth" class="button success" type="button">确认授权</button>
-              <button id="cancelPixivOAuth" class="button ghost" type="button">取消</button>
-            </div>
-          </div>
         </section>
 
         <details class="advanced-block">

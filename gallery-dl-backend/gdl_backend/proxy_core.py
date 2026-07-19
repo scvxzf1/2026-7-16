@@ -116,6 +116,7 @@ def _prepare_nodes(nodes: Iterable[ParsedProxyNode]) -> list[_PreparedNode]:
             continue
         protocol = str(source.get("type") or node.scheme or "").strip().lower()
         host = str(source.get("server") or node.host or "").strip()
+        port_range = str(source.get("port-range") or "").strip() if protocol == "mieru" else ""
         try:
             port = int(source.get("port") or node.port or 0)
         except (TypeError, ValueError):
@@ -126,7 +127,10 @@ def _prepare_nodes(nodes: Iterable[ParsedProxyNode]) -> list[_PreparedNode]:
         source["name"] = name
         source["type"] = protocol
         source["server"] = host
-        source["port"] = port
+        if port_range:
+            source.pop("port", None)
+        else:
+            source["port"] = port
         identity = yaml.safe_dump(source, allow_unicode=True, sort_keys=True)
         node_id = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:20]
         prepared.append(

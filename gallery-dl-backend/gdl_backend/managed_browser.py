@@ -8,7 +8,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 from urllib.request import ProxyHandler, build_opener
 
 import websocket
@@ -124,16 +124,25 @@ def read_browser_websocket(port: int) -> tuple[int, str] | None:
     return int(port), websocket_url
 
 
-def _page_websocket(browser_websocket_url: str) -> str:
+def _page_websocket(browser_websocket_url: str, target_id: str) -> str:
     parsed = urlsplit(browser_websocket_url)
     if parsed.scheme != "ws" or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}:
         raise RuntimeError("Chrome DevTools browser endpoint is invalid")
     port = parsed.port
     if port is None:
         raise RuntimeError("Chrome DevTools browser endpoint has no port")
-    targets = _devtools_json(port, "/json/list")
-    for target in targets if isinstance(targets, list) else ():
-        if isinstance(target, dict) and target.get("type") == "page":
+    expected = str(target_id or "").strip()
+    if not expected:
+        raise RuntimeError("Chrome DevTools target id is missing")
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        targets = _devtools_json(port, "/json/list")
+        for target in targets if isinstance(targets, list) else ():
+            if not isinstance(target, dict) or target.get("type") != "page":
+                continue
+            current_id = str(target.get("id") or target.get("targetId") or "")
+            if current_id != expected:
+                continue
             websocket_url = str(target.get("webSocketDebuggerUrl") or "")
             page = urlsplit(websocket_url)
             if (
@@ -143,6 +152,7 @@ def _page_websocket(browser_websocket_url: str) -> str:
                 and page.path.startswith("/devtools/page/")
             ):
                 return websocket_url
+        time.sleep(0.05)
     raise RuntimeError("Chrome DevTools page target was not found")
 
 
@@ -175,6 +185,129 @@ def cdp_request(
                 raise RuntimeError(str(error.get("message") or "Chrome DevTools request failed"))
             result = payload.get("result")
             return result if isinstance(result, dict) else {}
+    finally:
+        connection.close()
+
+
+def _is_pixiv_oauth_callback(url: str) -> bool:
+    try:
+        parsed = urlsplit(str(url or ""))
+        query = parse_qs(parsed.query, keep_blank_values=True)
+        codes = query.get("code", ())
+        states = query.get("state", ())
+        return (
+            parsed.scheme == "https"
+            and (parsed.hostname or "").lower() == "app-api.pixiv.net"
+            and parsed.path == "/web/v1/users/auth/pixiv/callback"
+            and len(codes) == 1
+            and bool(codes[0].strip())
+            and len(states) == 1
+            and bool(states[0].strip())
+        )
+    except ValueError:
+        return False
+
+
+def capture_pixiv_oauth_callback(
+    browser_websocket_url: str,
+    target_id: str,
+    login_url: str,
+    *,
+    timeout: float = 600,
+) -> str:
+    """Navigate a dedicated Chrome page and return its Pixiv OAuth callback URL."""
+
+    login = urlsplit(str(login_url or ""))
+    if (
+        login.scheme != "https"
+        or (login.hostname or "").lower() != "app-api.pixiv.net"
+        or login.path != "/web/v1/login"
+    ):
+        raise ValueError("Pixiv OAuth login URL is invalid")
+
+    page_websocket_url = _page_websocket(browser_websocket_url, target_id)
+    deadline = time.monotonic() + max(1.0, float(timeout))
+    connection = websocket.create_connection(
+        page_websocket_url,
+        timeout=min(5.0, max(1.0, float(timeout))),
+        suppress_origin=True,
+    )
+    request_id = 0
+    captured_callback = ""
+
+    def remember_callback(payload: dict[str, Any]) -> None:
+        nonlocal captured_callback
+        if captured_callback:
+            return
+        method = payload.get("method")
+        params = payload.get("params") if isinstance(payload.get("params"), dict) else {}
+        if method == "Network.requestWillBeSent":
+            request = params.get("request") if isinstance(params.get("request"), dict) else {}
+            url = str(request.get("url") or "")
+        elif method == "Network.responseReceived":
+            response = params.get("response") if isinstance(params.get("response"), dict) else {}
+            url = str(response.get("url") or "")
+        else:
+            return
+        if _is_pixiv_oauth_callback(url):
+            captured_callback = url
+
+    def command(method: str, params: dict[str, Any] | None = None) -> None:
+        nonlocal request_id
+        request_id += 1
+        current_id = request_id
+        connection.send(
+            json.dumps(
+                {"id": current_id, "method": method, "params": params or {}},
+                separators=(",", ":"),
+            )
+        )
+        while time.monotonic() < deadline:
+            remaining = deadline - time.monotonic()
+            connection.settimeout(max(0.1, min(1.0, remaining)))
+            try:
+                raw = connection.recv()
+            except websocket.WebSocketTimeoutException:
+                continue
+            if not raw:
+                raise RuntimeError("Pixiv project Chrome DevTools connection closed")
+            payload = json.loads(raw)
+            if payload.get("id") != current_id:
+                # CDP can emit redirect/network events before Page.navigate's
+                # response. Remember the short-lived callback instead of
+                # discarding it while waiting for the command acknowledgement.
+                remember_callback(payload)
+                continue
+            error = payload.get("error")
+            if error:
+                raise RuntimeError(
+                    str(error.get("message") or "Pixiv project Chrome DevTools command failed")
+                )
+            return
+        raise TimeoutError("Pixiv project Chrome DevTools command timed out")
+
+    try:
+        # Enable Network before navigation so the short-lived callback request
+        # cannot race ahead of the listener. Pixiv redirects it to pixiv://.
+        command("Network.enable")
+        command("Page.enable")
+        command("Page.navigate", {"url": login_url})
+        if captured_callback:
+            return captured_callback
+        while time.monotonic() < deadline:
+            remaining = deadline - time.monotonic()
+            connection.settimeout(max(0.1, min(1.0, remaining)))
+            try:
+                raw = connection.recv()
+            except websocket.WebSocketTimeoutException:
+                continue
+            if not raw:
+                raise RuntimeError("Pixiv project Chrome DevTools connection closed")
+            payload = json.loads(raw)
+            remember_callback(payload)
+            if captured_callback:
+                return captured_callback
+        raise TimeoutError("Pixiv login timed out before the OAuth callback")
     finally:
         connection.close()
 
@@ -212,7 +345,11 @@ def get_site_cookies(websocket_url: str, spec: ManagedBrowserSite) -> list[dict[
     return site_cookies(cookies if isinstance(cookies, list) else [], spec)
 
 
-def managed_login_ready(websocket_url: str, spec: ManagedBrowserSite) -> bool:
+def managed_login_ready(
+    websocket_url: str,
+    spec: ManagedBrowserSite,
+    target_id: str,
+) -> bool:
     """Confirm that cookie creation was followed by a completed login page."""
 
     if spec.site != "twitter":
@@ -224,6 +361,8 @@ def managed_login_ready(websocket_url: str, spec: ManagedBrowserSite) -> bool:
     for target in targets:
         if not isinstance(target, dict) or target.get("type") != "page":
             continue
+        if str(target.get("targetId") or "") != str(target_id or ""):
+            continue
         parsed = urlsplit(str(target.get("url") or ""))
         if (parsed.hostname or "").lower() not in {"x.com", "www.x.com", "twitter.com"}:
             continue
@@ -234,36 +373,21 @@ def managed_login_ready(websocket_url: str, spec: ManagedBrowserSite) -> bool:
     return False
 
 
-def clear_site_cookies(websocket_url: str, spec: ManagedBrowserSite) -> None:
-    page_websocket_url = _page_websocket(websocket_url)
-    credential_names = set(spec.required) | set(spec.recommended)
-    for cookie in get_site_cookies(websocket_url, spec):
-        if str(cookie.get("name") or "") not in credential_names:
-            continue
-        params: dict[str, Any] = {
-            "name": str(cookie.get("name") or ""),
-            "domain": str(cookie.get("domain") or ""),
-            "path": str(cookie.get("path") or "/"),
-        }
-        partition_key = cookie.get("partitionKey")
-        if isinstance(partition_key, dict):
-            params["partitionKey"] = partition_key
-        cdp_request(page_websocket_url, "Network.deleteCookies", params)
-
-
-def open_login_target(websocket_url: str, login_url: str) -> None:
-    before = cdp_request(websocket_url, "Target.getTargets").get("targetInfos") or []
+def open_login_target(websocket_url: str, login_url: str) -> str:
     created = cdp_request(websocket_url, "Target.createTarget", {"url": login_url})
     created_id = str(created.get("targetId") or "")
-    for target in before:
-        if not isinstance(target, dict):
-            continue
-        target_id = str(target.get("targetId") or "")
-        if target_id and target_id != created_id and target.get("type") == "page" and target.get("url") == "about:blank":
-            try:
-                cdp_request(websocket_url, "Target.closeTarget", {"targetId": target_id})
-            except Exception:
-                pass
+    if not created_id:
+        raise RuntimeError("Chrome DevTools did not create a page target")
+    return created_id
+
+
+def close_target(websocket_url: str, target_id: str) -> None:
+    if not websocket_url or not target_id:
+        return
+    try:
+        cdp_request(websocket_url, "Target.closeTarget", {"targetId": target_id}, timeout=2)
+    except Exception:
+        pass
 
 
 def close_browser(websocket_url: str) -> None:

@@ -74,11 +74,38 @@ class _FakeProcess:
 
 
 class DiscoveryParserTests(unittest.TestCase):
+    def test_pixiv_search_url_targets_users(self):
+        url = search_site("pixiv").search_url("这也是QAQ")
+        self.assertEqual(
+            url,
+            "https://www.pixiv.net/users/?nick=%E8%BF%99%E4%B9%9F%E6%98%AFQAQ",
+        )
+
+    def test_pixiv_user_search_queue_becomes_account_author(self):
+        stdout = json.dumps(
+            [[6, "https://www.pixiv.net/users/77/artworks", {
+                "user": {"id": 77, "account": "artist_account", "name": "这也是QAQ"}
+            }]]
+        )
+        candidates, authors = parse_discovery_output(
+            "pixiv",
+            stdout,
+            source_url="https://www.pixiv.net/users/?nick=test",
+            limit=20,
+        )
+        self.assertEqual(candidates, [])
+        self.assertEqual(authors[0]["id"], "77")
+        self.assertEqual(authors[0]["display_name"], "这也是QAQ")
+        self.assertEqual(
+            authors[0]["works_url"],
+            "https://www.pixiv.net/users/77/artworks",
+        )
+
     def test_site_aliases_and_search_urls(self):
         self.assertEqual(search_site("x").site, "twitter")
         self.assertEqual(search_site("eh").site, "exhentai")
         self.assertIn("q=clover+days", search_site("twitter").search_url("clover days"))
-        self.assertIn("clover%20days", search_site("pixiv").search_url("clover days"))
+        self.assertIn("nick=clover+days", search_site("pixiv").search_url("clover days"))
         self.assertIn("tags=clover_days", search_site("danbooru").search_url("clover_days"))
         self.assertIn("f_search=clover+days", search_site("exhentai").search_url("clover days"))
 
@@ -131,7 +158,16 @@ class DiscoveryParserTests(unittest.TestCase):
                     "hashtags": ["art"],
                 },
             ],
-            [3, "https://pbs.twimg.com/media/sample.jpg", {"tweet_id": 123456789}],
+            [
+                3,
+                "https://pbs.twimg.com/media/sample?format=jpg&name=orig",
+                {"tweet_id": 123456789, "num": 1},
+            ],
+            [
+                3,
+                "https://video.twimg.com/ext_tw_video/123/pu/vid/1280x720/sample.mp4?tag=12",
+                {"tweet_id": 123456789, "num": 2},
+            ],
         ]
         candidates, authors = parse_discovery_output(
             "twitter",
@@ -142,7 +178,17 @@ class DiscoveryParserTests(unittest.TestCase):
         self.assertEqual(len(candidates), 1)
         self.assertEqual(candidates[0]["url"], "https://x.com/artist/status/123456789")
         self.assertEqual(candidates[0]["media_count"], 2)
-        self.assertEqual(candidates[0]["thumbnail_url"], "https://pbs.twimg.com/media/sample.jpg")
+        self.assertEqual(
+            candidates[0]["thumbnail_url"],
+            "https://pbs.twimg.com/media/sample?format=jpg&name=orig",
+        )
+        self.assertEqual(
+            candidates[0]["media_urls"],
+            [
+                "https://pbs.twimg.com/media/sample?format=jpg&name=orig",
+                "https://video.twimg.com/ext_tw_video/123/pu/vid/1280x720/sample.mp4?tag=12",
+            ],
+        )
         self.assertEqual(authors[0]["works_url"], "https://x.com/artist/media")
 
     def test_twitter_author_deduplication_is_case_insensitive(self):
@@ -800,6 +846,52 @@ class DiscoveryParserTests(unittest.TestCase):
         self.assertEqual(proxy.acquired[0][1]["node_tags"], ["jp"])
         self.assertFalse(proxy.released[0][1]["proxy_fault"])
 
+    def test_pixiv_discovery_emits_only_the_first_media_per_work(self):
+        stdout = json.dumps(
+            [
+                [
+                    2,
+                    {
+                        "id": 123,
+                        "title": "multi-page",
+                        "count": 53,
+                        "user": {"id": 77, "account": "artist", "name": "Artist"},
+                    },
+                ],
+                [3, "https://i.pximg.net/example_p0.png", {"id": 123, "num": 0}],
+            ]
+        )
+        gallery = _FakeGallery(stdout)
+        with tempfile.TemporaryDirectory() as temporary:
+            service = DiscoveryService(gallery, _FakeProxy(), Path(temporary))
+            result = asyncio.run(
+                service.discover_url(
+                    site="pixiv",
+                    url="https://www.pixiv.net/users/77/artworks",
+                    keyword=None,
+                    limit=5,
+                    range_kind=None,
+                    policy=SitePolicy(proxy_mode="direct", retry_limit=0),
+                    proxy_mode="direct",
+                    credentials_ref=None,
+                    cookies_file=None,
+                    config_file=None,
+                    extra_args=["--filter", "rating == 'g'"],
+                    timeout_seconds=30,
+                )
+            )
+        self.assertEqual(result["candidates"][0]["media_count"], 53)
+        self.assertEqual(
+            gallery.calls[0][1]["extra_args"],
+            [
+                "--dump-json",
+                "--post-range",
+                "1-5",
+                "--filter",
+                "(rating == 'g') and (num == 0)",
+            ],
+        )
+
     def test_cloudflare_parse_error_retries_and_reports_attempts(self):
         gallery = _FakeGallery(
             json.dumps(
@@ -960,8 +1052,13 @@ class DiscoveryParserTests(unittest.TestCase):
                 GalleryRunner._credentials("missing-profile")
 
     def test_capture_stops_at_streaming_output_limit(self):
+        class HangingPipeProcess(_FakeProcess):
+            def __init__(self):
+                super().__init__(b"x" * 1024)
+                self.stderr = asyncio.StreamReader()
+
         async def create_process(*args, **kwargs):
-            return _FakeProcess(b"x" * 1024)
+            return HangingPipeProcess()
 
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -973,19 +1070,22 @@ class DiscoveryParserTests(unittest.TestCase):
                     "gdl_backend.gallery.asyncio.create_subprocess_exec",
                     new=create_process,
                 ):
-                    await runner.capture(
-                        "limited",
-                        url="https://danbooru.donmai.us/posts/1",
-                        output_dir=str(root / "capture"),
-                        proxy_url=None,
-                        http_timeout=10,
-                        gallery_retries=0,
-                        task_timeout=30,
-                        cookies_file=None,
-                        config_file=None,
-                        credentials_ref=None,
-                        extra_args=["--dump-json"],
-                        max_output_bytes=100,
+                    await asyncio.wait_for(
+                        runner.capture(
+                            "limited",
+                            url="https://danbooru.donmai.us/posts/1",
+                            output_dir=str(root / "capture"),
+                            proxy_url=None,
+                            http_timeout=10,
+                            gallery_retries=0,
+                            task_timeout=30,
+                            cookies_file=None,
+                            config_file=None,
+                            credentials_ref=None,
+                            extra_args=["--dump-json"],
+                            max_output_bytes=100,
+                        ),
+                        timeout=1,
                     )
 
             with self.assertRaises(ValueError):

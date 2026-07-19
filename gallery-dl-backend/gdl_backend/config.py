@@ -32,7 +32,6 @@ def _paths(values: list[str] | None, base: Path, defaults: list[Path]) -> list[P
 class ServerSettings:
     host: str = "127.0.0.1"
     port: int = 8787
-    api_key: str = ""
     cors_origins: list[str] = field(default_factory=list)
     allow_private_targets: bool = False
 
@@ -100,9 +99,8 @@ class ProxySettings:
     node_file: Path | None = None
     inline_nodes: list[str] = field(default_factory=list)
     allow_socks: bool = True
-    max_nodes: int = 50
     probe_url: str = "https://example.com/"
-    probe_timeout_seconds: float = 5.0
+    probe_timeout_seconds: float = 10.0
     probe_workers: int = 32
     health_interval_seconds: float = 60.0
     fail_cooldown_seconds: float = 30.0
@@ -180,7 +178,6 @@ class AppSettings:
         server = ServerSettings(
             host=str(os.environ.get("GDL_BACKEND_HOST", server_data.get("host", "127.0.0.1"))),
             port=int(os.environ.get("GDL_BACKEND_PORT", server_data.get("port", 8787))),
-            api_key=str(os.environ.get("GDL_BACKEND_API_KEY", server_data.get("api_key", ""))),
             cors_origins=[str(x) for x in server_data.get("cors_origins", [])],
             allow_private_targets=bool(server_data.get("allow_private_targets", False)),
         )
@@ -218,9 +215,8 @@ class AppSettings:
             node_file=_path(node_file_value, base, base) if node_file_value else None,
             inline_nodes=[str(x).strip() for x in proxy_data.get("inline_nodes", []) if str(x).strip()],
             allow_socks=bool(proxy_data.get("allow_socks", True)),
-            max_nodes=int(proxy_data.get("max_nodes", 50)),
             probe_url=str(proxy_data.get("probe_url", "https://example.com/")),
-            probe_timeout_seconds=float(proxy_data.get("probe_timeout_seconds", 5.0)),
+            probe_timeout_seconds=float(proxy_data.get("probe_timeout_seconds", 10.0)),
             probe_workers=int(proxy_data.get("probe_workers", 32)),
             health_interval_seconds=float(proxy_data.get("health_interval_seconds", 60.0)),
             fail_cooldown_seconds=float(proxy_data.get("fail_cooldown_seconds", 30.0)),
@@ -267,16 +263,14 @@ class AppSettings:
         if not 1 <= int(self.server.port) <= 65535:
             raise ValueError("server.port 超出范围")
         host = self.server.host.strip().lower()
-        if host not in {"127.0.0.1", "localhost", "::1"} and not self.server.api_key:
-            raise ValueError("监听非回环地址时必须配置 server.api_key")
+        if host not in {"127.0.0.1", "localhost", "::1"}:
+            raise ValueError("本地服务仅允许监听回环地址")
         if self.proxy.engine != "native":
             raise ValueError("proxy.engine 当前支持 native")
         if self.auth.browser_login_timeout_seconds <= 0:
             raise ValueError("auth.browser_login_timeout_seconds 必须大于 0")
         if self.auth.browser_poll_interval_seconds <= 0:
             raise ValueError("auth.browser_poll_interval_seconds 必须大于 0")
-        if not 1 <= int(self.proxy.max_nodes) <= 10000:
-            raise ValueError("proxy.max_nodes 必须位于 1..10000")
         if not 1 <= int(self.proxy.probe_workers) <= 64:
             raise ValueError("proxy.probe_workers 必须位于 1..64")
         if self.proxy.probe_timeout_seconds <= 0 or self.proxy.subscription_timeout_seconds <= 0:
@@ -344,7 +338,6 @@ class AppSettings:
             "server": {
                 "host": self.server.host,
                 "port": self.server.port,
-                "api_key_configured": bool(self.server.api_key),
                 "cors_origins": list(self.server.cors_origins),
                 "allow_private_targets": self.server.allow_private_targets,
             },
@@ -369,8 +362,8 @@ class AppSettings:
                 "node_file": str(self.proxy.node_file) if self.proxy.node_file else None,
                 "inline_node_count": len(self.proxy.inline_nodes),
                 "allow_socks": self.proxy.allow_socks,
-                "max_nodes": self.proxy.max_nodes,
                 "probe_url": self.proxy.probe_url,
+                "probe_timeout_seconds": self.proxy.probe_timeout_seconds,
                 "transport_core_enabled": self.proxy.transport_core_enabled,
                 "transport_core_binary": str(self.proxy.transport_core_binary),
                 "transport_core_sha256": self.proxy.transport_core_sha256,

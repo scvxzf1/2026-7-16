@@ -10,6 +10,7 @@ from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Awaitable, Callable
+from urllib.parse import urlsplit
 
 from .config import GallerySettings
 from .process_control import terminate_process
@@ -18,6 +19,14 @@ from .redaction import redact_text
 
 LineCallback = Callable[[str, str], Awaitable[None]]
 StartedCallback = Callable[[int, str], Awaitable[None]]
+_TWITTER_WEB_HOSTS = {"x.com", "www.x.com", "twitter.com", "www.twitter.com"}
+
+
+def _is_twitter_web_url(url: str) -> bool:
+    lower = url.lower()
+    positions = [position for position in (lower.find("http://"), lower.find("https://")) if position >= 0]
+    plain_url = url[min(positions) :] if positions else url
+    return (urlsplit(plain_url).hostname or "").lower() in _TWITTER_WEB_HOSTS
 
 
 @dataclass(slots=True)
@@ -126,6 +135,8 @@ class GalleryRunner:
         if proxy_url:
             command.extend(["--proxy", proxy_url])
         command.extend(self.validate_args(extra_args))
+        if cookies_file and _is_twitter_web_url(url):
+            command.extend(["--option", "extractor.twitter.cookies-update=false"])
         command.append(url)
         return command
 
@@ -180,7 +191,9 @@ class GalleryRunner:
             "stderr": asyncio.subprocess.PIPE,
         }
         if os.name == "nt":
-            kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+            kwargs["creationflags"] = (
+                subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
+            )
         else:
             kwargs["start_new_session"] = True
         process = await asyncio.create_subprocess_exec(*command, **kwargs)
@@ -284,7 +297,9 @@ class GalleryRunner:
             "stderr": asyncio.subprocess.PIPE,
         }
         if os.name == "nt":
-            kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+            kwargs["creationflags"] = (
+                subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
+            )
         else:
             kwargs["start_new_session"] = True
         process = await asyncio.create_subprocess_exec(*command, **kwargs)
@@ -292,48 +307,87 @@ class GalleryRunner:
             self._active[operation_id] = (process, marker)
 
         captured_bytes = 0
+        stdout_chunks: list[bytes] = []
+        stderr_chunks: list[bytes] = []
 
-        async def read_limited(stream: asyncio.StreamReader | None) -> bytes:
+        async def read_limited(
+            stream: asyncio.StreamReader | None,
+            chunks: list[bytes],
+        ) -> None:
             nonlocal captured_bytes
             if stream is None:
-                return b""
-            chunks: list[bytes] = []
+                return
             while True:
                 chunk = await stream.read(64 * 1024)
                 if not chunk:
-                    return b"".join(chunks)
+                    return
                 captured_bytes += len(chunk)
+                chunks.append(chunk)
                 if captured_bytes > max_output_bytes:
                     raise _CaptureLimitExceeded
-                chunks.append(chunk)
 
         readers = [
-            asyncio.create_task(read_limited(process.stdout)),
-            asyncio.create_task(read_limited(process.stderr)),
+            asyncio.create_task(read_limited(process.stdout, stdout_chunks)),
+            asyncio.create_task(read_limited(process.stderr, stderr_chunks)),
         ]
         waiter = asyncio.create_task(process.wait())
         group = asyncio.gather(waiter, *readers)
+        cleanup_timeout = max(
+            1.0,
+            min(5.0, float(self.settings.terminate_grace_seconds)),
+        )
+
+        async def settle_group() -> None:
+            try:
+                await asyncio.wait_for(asyncio.shield(group), timeout=cleanup_timeout)
+            except BaseException:
+                pass
+            tasks = [waiter, *readers]
+            pending = [task for task in tasks if not task.done()]
+            for task in pending:
+                task.cancel()
+            if pending:
+                done, still_pending = await asyncio.wait(pending, timeout=cleanup_timeout)
+                for task in still_pending:
+                    task.cancel()
+                for task in done:
+                    if not task.cancelled():
+                        try:
+                            task.exception()
+                        except BaseException:
+                            pass
+            if not group.done():
+                group.cancel()
+            try:
+                group.exception()
+            except BaseException:
+                pass
+
         timed_out = False
         try:
             if task_timeout and task_timeout > 0:
                 try:
-                    _, stdout_raw, stderr_raw = await asyncio.wait_for(
+                    await asyncio.wait_for(
                         asyncio.shield(group),
                         timeout=task_timeout,
                     )
                 except asyncio.TimeoutError:
                     timed_out = True
                     await terminate_process(process, self.settings.terminate_grace_seconds)
-                    _, stdout_raw, stderr_raw = await group
+                    await settle_group()
             else:
-                _, stdout_raw, stderr_raw = await group
+                await group
         except _CaptureLimitExceeded as exc:
             await terminate_process(process, self.settings.terminate_grace_seconds)
-            await asyncio.gather(waiter, *readers, return_exceptions=True)
+            await settle_group()
             raise ValueError(f"gallery-dl 元数据输出超过 {max_output_bytes} 字节上限") from exc
         except asyncio.CancelledError:
             await terminate_process(process, self.settings.terminate_grace_seconds)
-            await asyncio.gather(waiter, *readers, return_exceptions=True)
+            await settle_group()
+            raise
+        except Exception:
+            await terminate_process(process, self.settings.terminate_grace_seconds)
+            await settle_group()
             raise
         finally:
             async with self._lock:
@@ -341,6 +395,8 @@ class GalleryRunner:
                 if current and current[0] is process:
                     self._active.pop(operation_id, None)
 
+        stdout_raw = b"".join(stdout_chunks)
+        stderr_raw = b"".join(stderr_chunks)
         stdout = stdout_raw.decode("utf-8", "replace")
         for secret in (username, password):
             if secret:

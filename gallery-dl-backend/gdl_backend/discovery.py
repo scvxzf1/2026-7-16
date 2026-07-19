@@ -33,7 +33,7 @@ class SearchSiteSpec:
         if self.site == "twitter":
             return "https://x.com/search?" + urlencode({"q": keyword, "f": "live"})
         if self.site == "pixiv":
-            return f"https://www.pixiv.net/en/tags/{quote(keyword, safe='')}/artworks"
+            return "https://www.pixiv.net/users/?" + urlencode({"nick": keyword})
         if self.site == "danbooru":
             return "https://danbooru.donmai.us/posts?" + urlencode({"tags": keyword})
         if self.site == "exhentai":
@@ -249,6 +249,23 @@ def validate_discovery_args(args: list[str]) -> list[str]:
         option = value.split("=", 1)[0]
         if option in _DISCOVERY_MANAGED_ARGS:
             raise ValueError(f"搜索输出协议参数由后端管理: {option}")
+    return values
+
+
+def _pixiv_first_media_args(args: list[str]) -> list[str]:
+    values = list(args)
+    for index in range(len(values) - 1, -1, -1):
+        value = values[index]
+        if value == "--filter":
+            if index + 1 >= len(values):
+                raise ValueError("--filter 缺少表达式")
+            values[index + 1] = f"({values[index + 1]}) and (num == 0)"
+            return values
+        if value.startswith("--filter="):
+            expression = value.split("=", 1)[1]
+            values[index] = f"--filter=({expression}) and (num == 0)"
+            return values
+    values.extend(["--filter", "num == 0"])
     return values
 
 
@@ -469,6 +486,23 @@ def _pixiv_candidate(data: dict[str, Any]) -> tuple[dict[str, Any] | None, list[
     return candidate, [author] if author else []
 
 
+def _pixiv_user_queue(data: dict[str, Any]) -> tuple[None, list[dict[str, Any]]]:
+    user = data.get("user") if isinstance(data.get("user"), dict) else data
+    author_id = _integer(user.get("id"))
+    if author_id is None:
+        return None, []
+    profile = f"https://www.pixiv.net/users/{author_id}"
+    author = _author(
+        "pixiv",
+        author_id=author_id,
+        name=user.get("account"),
+        display_name=user.get("name"),
+        profile_url=profile,
+        works_url=f"{profile}/artworks",
+    )
+    return None, [author] if author else []
+
+
 def _danbooru_candidate(data: dict[str, Any]) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
     post_id = _integer(data.get("id"))
     if post_id is None:
@@ -687,14 +721,22 @@ def parse_discovery_output(
                 add(*_exhentai_queue_candidate(str(message[1]), message[-1]))
             elif site == "danbooru":
                 add(*_danbooru_artist_queue(str(message[1]), message[-1]))
+            elif site == "pixiv":
+                add(*_pixiv_user_queue(message[-1]))
         elif message_type == 3 and len(message) >= 3 and isinstance(message[-1], dict):
             data = message[-1]
             item_id = data.get("tweet_id") if site == "twitter" else data.get("id")
             if site == "exhentai":
                 item_id = data.get("gid") or data.get("gallery_id")
             candidate = candidate_by_id.get(str(item_id))
-            if candidate is not None and not candidate.get("thumbnail_url"):
-                candidate["thumbnail_url"] = _text(message[1], 8192)
+            if candidate is not None:
+                media_url = _text(message[1], 8192)
+                if site == "twitter" and media_url:
+                    media_urls = candidate.setdefault("media_urls", [])
+                    if media_url not in media_urls:
+                        media_urls.append(media_url)
+                if media_url and not candidate.get("thumbnail_url"):
+                    candidate["thumbnail_url"] = media_url
 
     if errors:
         raise DiscoveryError(
@@ -1088,6 +1130,7 @@ class DiscoveryService:
                             operation_id,
                             node_tags=preferred_tags,
                             exclude_ids=tried,
+                            allowed_ids=getattr(policy, "allowed_proxy_ids", None),
                             probe_before_use=policy.probe_before_use,
                             probe_url=policy.probe_url,
                         )
@@ -1101,6 +1144,7 @@ class DiscoveryService:
                                 operation_id,
                                 node_tags=[],
                                 exclude_ids=tried,
+                                allowed_ids=getattr(policy, "allowed_proxy_ids", None),
                                 probe_before_use=policy.probe_before_use,
                                 probe_url=policy.probe_url,
                             )
@@ -1367,6 +1411,7 @@ class DiscoveryService:
                             operation_id,
                             node_tags=policy.node_tags,
                             exclude_ids=tried,
+                            allowed_ids=getattr(policy, "allowed_proxy_ids", None),
                             probe_before_use=policy.probe_before_use,
                             probe_url=policy.probe_url,
                         )
@@ -1635,6 +1680,7 @@ class DiscoveryService:
                             operation_id,
                             node_tags=preferred_tags,
                             exclude_ids=tried,
+                            allowed_ids=getattr(policy, "allowed_proxy_ids", None),
                             probe_before_use=policy.probe_before_use,
                             probe_url=policy.probe_url,
                         )
@@ -1648,6 +1694,7 @@ class DiscoveryService:
                                 operation_id,
                                 node_tags=[],
                                 exclude_ids=tried,
+                                allowed_ids=getattr(policy, "allowed_proxy_ids", None),
                                 probe_before_use=policy.probe_before_use,
                                 probe_url=policy.probe_url,
                             )
@@ -1802,6 +1849,8 @@ class DiscoveryService:
     ) -> dict[str, Any]:
         spec = search_site(site)
         values = validate_discovery_args(extra_args)
+        if spec.site == "pixiv":
+            values = _pixiv_first_media_args(values)
         if range_kind is None:
             if spec.site == "exhentai" and re.search(r"/(?:g|s|mpv)/", url):
                 range_kind = "file"
@@ -1833,6 +1882,7 @@ class DiscoveryService:
                             operation_id,
                             node_tags=policy.node_tags,
                             exclude_ids=tried,
+                            allowed_ids=getattr(policy, "allowed_proxy_ids", None),
                             probe_before_use=policy.probe_before_use,
                             probe_url=policy.probe_url,
                         )
