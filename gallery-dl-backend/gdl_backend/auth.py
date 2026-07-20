@@ -272,7 +272,7 @@ class AuthManager:
             except FileNotFoundError as exc:
                 raise AuthError(
                     "chrome_not_found",
-                    "没有找到 Google Chrome，请配置 auth.chrome_executable",
+                    "没有找到 Chrome 或 Chromium，请配置 auth.chrome_executable",
                 ) from exc
 
             profile_dir = self.browser_profile_dir

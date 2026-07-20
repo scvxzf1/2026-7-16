@@ -47,8 +47,6 @@
     "fail_cooldown_seconds": 30,
     "subscription_timeout_seconds": 20,
     "transport_core_enabled": true,
-    "transport_core_binary": "bin/proxy-core.exe",
-    "transport_core_sha256": "a3799f2d75c623a7c6d307e1faf88269e24dd746c59df3e9f1c84d5cfbff6c92",
     "transport_core_base_port": 29000,
     "transport_core_start_timeout_seconds": 15
   },

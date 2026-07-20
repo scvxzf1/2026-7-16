@@ -60,6 +60,12 @@ Desktop.ini
 /gallery-dl-backend/config.json
 /gallery-dl-backend/credentials/
 /gallery-dl-backend/runtime/
+/gallery-dl-backend/bin/mihomo
+/gallery-dl-backend/bin/mihomo.exe
+/gallery-dl-backend/bin/proxy-core
+/gallery-dl-backend/bin/proxy-core.exe
+/gallery-dl-backend/bin/verge-mihomo
+/gallery-dl-backend/bin/verge-mihomo.exe
 
 # Local airport subscriptions may contain connection credentials
 /*_Clash_*.yaml

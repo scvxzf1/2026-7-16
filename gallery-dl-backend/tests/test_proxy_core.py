@@ -1,13 +1,19 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 from gdl_backend.proxy import ProxyPoolAdapter
-from gdl_backend.proxy_core import CoreEndpoint, build_transport_config, resolve_core_binary
+from gdl_backend.proxy_core import (
+    CoreEndpoint,
+    _core_binary_names,
+    build_transport_config,
+    resolve_core_binary,
+)
 from gdl_backend.proxy_sources import parse_subscription_text
 
 from tests.helpers import make_settings
@@ -37,10 +43,69 @@ proxies:
 
 
 class ProxyCoreTests(unittest.TestCase):
+    def test_core_binary_search_names_are_platform_specific(self):
+        self.assertEqual(_core_binary_names("posix"), ("proxy-core", "mihomo", "verge-mihomo"))
+        self.assertEqual(
+            _core_binary_names("nt")[:3],
+            ("proxy-core.exe", "mihomo.exe", "verge-mihomo.exe"),
+        )
+
+    def test_project_bin_is_preferred_over_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project_binary = root / ("proxy-core.exe" if os.name == "nt" else "proxy-core")
+            path_binary = root / ("mihomo.exe" if os.name == "nt" else "mihomo")
+            project_binary.write_bytes(b"project-core")
+            path_binary.write_bytes(b"path-core")
+            if os.name != "nt":
+                project_binary.chmod(0o700)
+                path_binary.chmod(0o700)
+
+            with (
+                patch("gdl_backend.proxy_core.PROJECT_BIN_DIR", root),
+                patch("gdl_backend.proxy_core.shutil.which", return_value=str(path_binary)),
+            ):
+                self.assertEqual(resolve_core_binary(None), project_binary.resolve())
+
+    def test_core_binary_is_discovered_from_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            binary = Path(tmp) / ("mihomo.exe" if os.name == "nt" else "mihomo")
+            binary.write_bytes(b"fixture-core")
+            if os.name != "nt":
+                binary.chmod(0o700)
+            digest = hashlib.sha256(b"fixture-core").hexdigest()
+
+            def which(name: str):
+                return str(binary) if name == binary.name else None
+
+            with (
+                patch("gdl_backend.proxy_core.PROJECT_BIN_DIR", Path(tmp) / "empty-project-bin"),
+                patch("gdl_backend.proxy_core.shutil.which", side_effect=which),
+            ):
+                self.assertEqual(resolve_core_binary(None, digest), binary.resolve())
+
+    def test_explicit_core_binary_does_not_fall_back_to_path(self):
+        missing = Path("missing-explicit-core")
+        with patch("gdl_backend.proxy_core.shutil.which", return_value="system-mihomo") as which:
+            with self.assertRaisesRegex(FileNotFoundError, "missing-explicit-core"):
+                resolve_core_binary(missing)
+        which.assert_not_called()
+
+    @unittest.skipIf(os.name == "nt", "POSIX executable permissions only")
+    def test_core_binary_requires_execute_permission_on_posix(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            binary = Path(tmp) / "mihomo"
+            binary.write_bytes(b"fixture-core")
+            binary.chmod(0o600)
+            with self.assertRaisesRegex(PermissionError, "执行权限"):
+                resolve_core_binary(binary)
+
     def test_core_binary_sha256_is_verified(self):
         with tempfile.TemporaryDirectory() as tmp:
             binary = Path(tmp) / "proxy-core.exe"
             binary.write_bytes(b"fixture-core")
+            if os.name != "nt":
+                binary.chmod(0o700)
             digest = hashlib.sha256(b"fixture-core").hexdigest()
             self.assertEqual(resolve_core_binary(binary, digest), binary.resolve())
             with self.assertRaisesRegex(RuntimeError, "SHA-256"):

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from gdl_backend.managed_browser import (
@@ -9,12 +12,35 @@ from gdl_backend.managed_browser import (
     _is_pixiv_oauth_callback,
     _page_websocket,
     capture_pixiv_oauth_callback,
+    discover_chrome_executable,
     managed_login_ready,
     read_browser_websocket,
 )
 
 
 class ManagedBrowserTests(unittest.TestCase):
+    def test_chromium_is_discovered_from_path(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            executable = Path(temporary) / "chromium"
+            executable.write_bytes(b"fixture-browser")
+            if os.name != "nt":
+                executable.chmod(0o700)
+
+            def which(name: str) -> str | None:
+                return str(executable) if name == "chromium" else None
+
+            with patch("gdl_backend.managed_browser.shutil.which", side_effect=which):
+                self.assertEqual(discover_chrome_executable(), executable.resolve())
+
+    def test_explicit_chrome_path_does_not_fall_back_to_system_browser(self):
+        with patch(
+            "gdl_backend.managed_browser.shutil.which",
+            return_value="system-chrome",
+        ) as which:
+            with self.assertRaises(FileNotFoundError):
+                discover_chrome_executable("missing-explicit-chrome")
+        which.assert_not_called()
+
     def test_browser_websocket_is_discovered_from_fixed_loopback_port(self):
         with patch(
             "gdl_backend.managed_browser._devtools_json",

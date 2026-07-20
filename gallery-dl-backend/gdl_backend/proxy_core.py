@@ -19,6 +19,9 @@ from .proxy_sources import ParsedProxyNode
 from .redaction import redact_text
 
 
+PROJECT_BIN_DIR = Path(__file__).resolve().parents[1] / "bin"
+
+
 @dataclass(frozen=True, slots=True)
 class CoreEndpoint:
     id: str
@@ -42,21 +45,40 @@ def _file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _core_binary_names(platform_name: str | None = None) -> tuple[str, ...]:
+    if (platform_name or os.name) == "nt":
+        return (
+            "proxy-core.exe",
+            "mihomo.exe",
+            "verge-mihomo.exe",
+            "proxy-core",
+            "mihomo",
+            "verge-mihomo",
+        )
+    return ("proxy-core", "mihomo", "verge-mihomo")
+
+
 def resolve_core_binary(
     explicit: Path | str | None,
     expected_sha256: str = "",
 ) -> Path:
     expected = str(expected_sha256 or "").strip().lower()
     candidates: list[Path] = []
+    non_executable: list[Path] = []
     if explicit:
         candidates.append(Path(explicit).expanduser())
-    for name in ("proxy-core", "proxy-core.exe", "mihomo", "mihomo.exe", "verge-mihomo"):
-        found = shutil.which(name)
-        if found:
-            candidates.append(Path(found))
+    else:
+        candidates.extend(PROJECT_BIN_DIR / name for name in _core_binary_names())
+        for name in _core_binary_names():
+            found = shutil.which(name)
+            if found:
+                candidates.append(Path(found))
     for candidate in candidates:
         resolved = candidate.resolve()
         if resolved.is_file():
+            if os.name != "nt" and not os.access(resolved, os.X_OK):
+                non_executable.append(resolved)
+                continue
             if expected:
                 actual = _file_sha256(resolved)
                 if not hmac.compare_digest(actual, expected):
@@ -65,7 +87,15 @@ def resolve_core_binary(
                         f"expected={expected}, actual={actual}"
                     )
             return resolved
-    raise FileNotFoundError("代理传输核心文件不存在，请检查 proxy.transport_core_binary")
+    if non_executable:
+        raise PermissionError(f"代理传输核心没有执行权限: {non_executable[0]}")
+    if explicit:
+        raise FileNotFoundError(f"代理传输核心文件不存在: {Path(explicit).expanduser()}")
+    raise FileNotFoundError(
+        "代理传输核心文件不存在；请运行 scripts/install_mihomo.sh（Linux）或 "
+        "scripts/install_mihomo.ps1（Windows）安装到项目 bin 目录，"
+        "或将 mihomo 加入 PATH，或设置 proxy.transport_core_binary"
+    )
 
 
 def _restrict_sensitive_file(path: Path) -> None:

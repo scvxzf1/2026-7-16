@@ -51,36 +51,46 @@ def discover_chrome_executable(explicit: str = "") -> Path:
     configured = explicit.strip() or os.environ.get("GDL_BACKEND_CHROME", "").strip()
     if configured:
         candidates.append(Path(os.path.expandvars(os.path.expanduser(configured))))
-    for name in ("chrome.exe", "chrome", "google-chrome", "google-chrome-stable"):
-        found = shutil.which(name)
-        if found:
-            candidates.append(Path(found))
-    if os.name == "nt":
-        for root in (
-            os.environ.get("PROGRAMFILES"),
-            os.environ.get("PROGRAMFILES(X86)"),
-            os.environ.get("LOCALAPPDATA"),
+    else:
+        for name in (
+            "chrome.exe",
+            "chrome",
+            "google-chrome",
+            "google-chrome-stable",
+            "chromium",
+            "chromium-browser",
         ):
-            if root:
-                candidates.append(Path(root) / "Google" / "Chrome" / "Application" / "chrome.exe")
-    elif os.name == "posix":
-        candidates.extend(
-            (
-                Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
-                Path("/usr/bin/google-chrome"),
-                Path("/usr/bin/google-chrome-stable"),
-                Path("/usr/bin/chromium"),
-                Path("/usr/bin/chromium-browser"),
+            found = shutil.which(name)
+            if found:
+                candidates.append(Path(found))
+        if os.name == "nt":
+            for root in (
+                os.environ.get("PROGRAMFILES"),
+                os.environ.get("PROGRAMFILES(X86)"),
+                os.environ.get("LOCALAPPDATA"),
+            ):
+                if root:
+                    candidates.append(
+                        Path(root) / "Google" / "Chrome" / "Application" / "chrome.exe"
+                    )
+        elif os.name == "posix":
+            candidates.extend(
+                (
+                    Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+                    Path("/usr/bin/google-chrome"),
+                    Path("/usr/bin/google-chrome-stable"),
+                    Path("/usr/bin/chromium"),
+                    Path("/usr/bin/chromium-browser"),
+                )
             )
-        )
     for candidate in candidates:
         try:
             resolved = candidate.expanduser().resolve()
         except OSError:
             continue
-        if resolved.is_file():
+        if resolved.is_file() and (os.name == "nt" or os.access(resolved, os.X_OK)):
             return resolved
-    raise FileNotFoundError("Google Chrome executable was not found")
+    raise FileNotFoundError("Chrome or Chromium executable was not found")
 
 
 def read_devtools_active_port(profile_dir: Path) -> tuple[int, str] | None:

@@ -106,10 +106,8 @@ class ProxySettings:
     fail_cooldown_seconds: float = 30.0
     subscription_timeout_seconds: float = 20.0
     transport_core_enabled: bool = True
-    transport_core_binary: Path = field(
-        default_factory=lambda: (PROJECT_DIR / "bin" / "proxy-core.exe").resolve()
-    )
-    transport_core_sha256: str = "a3799f2d75c623a7c6d307e1faf88269e24dd746c59df3e9f1c84d5cfbff6c92"
+    transport_core_binary: Path | None = None
+    transport_core_sha256: str = ""
     transport_core_base_port: int = 29000
     transport_core_start_timeout_seconds: float = 15.0
 
@@ -206,7 +204,12 @@ class AppSettings:
             ),
         )
         node_file_value = proxy_data.get("node_file")
-        transport_core_binary = proxy_data.get("transport_core_binary", "bin/proxy-core.exe")
+        transport_core_binary_value = proxy_data.get("transport_core_binary")
+        if transport_core_binary_value in (None, ""):
+            transport_core_binary = None
+        else:
+            transport_core_binary = _path(transport_core_binary_value, base, base)
+        transport_core_sha256 = str(proxy_data.get("transport_core_sha256") or "").strip().lower()
         proxy = ProxySettings(
             enabled=bool(proxy_data.get("enabled", True)),
             auto_start=bool(proxy_data.get("auto_start", True)),
@@ -222,9 +225,8 @@ class AppSettings:
             fail_cooldown_seconds=float(proxy_data.get("fail_cooldown_seconds", 30.0)),
             subscription_timeout_seconds=float(proxy_data.get("subscription_timeout_seconds", 20.0)),
             transport_core_enabled=bool(proxy_data.get("transport_core_enabled", True)),
-            transport_core_binary=_path(transport_core_binary, base, PROJECT_DIR / "bin" / "proxy-core.exe"),
-            transport_core_sha256=str(proxy_data.get("transport_core_sha256", "")).strip().lower()
-            or "a3799f2d75c623a7c6d307e1faf88269e24dd746c59df3e9f1c84d5cfbff6c92",
+            transport_core_binary=transport_core_binary,
+            transport_core_sha256=transport_core_sha256,
             transport_core_base_port=int(proxy_data.get("transport_core_base_port", 29000)),
             transport_core_start_timeout_seconds=float(
                 proxy_data.get("transport_core_start_timeout_seconds", 15.0)
@@ -365,7 +367,9 @@ class AppSettings:
                 "probe_url": self.proxy.probe_url,
                 "probe_timeout_seconds": self.proxy.probe_timeout_seconds,
                 "transport_core_enabled": self.proxy.transport_core_enabled,
-                "transport_core_binary": str(self.proxy.transport_core_binary),
+                "transport_core_binary": (
+                    str(self.proxy.transport_core_binary) if self.proxy.transport_core_binary else None
+                ),
                 "transport_core_sha256": self.proxy.transport_core_sha256,
                 "transport_core_base_port": self.proxy.transport_core_base_port,
             },
