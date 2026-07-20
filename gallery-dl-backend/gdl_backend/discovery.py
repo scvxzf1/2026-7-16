@@ -9,7 +9,7 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable
-from urllib.parse import parse_qs, quote, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit
 
 import requests
 from curl_cffi import requests as curl_requests
@@ -32,8 +32,6 @@ class SearchSiteSpec:
     def search_url(self, keyword: str) -> str:
         if self.site == "twitter":
             return "https://x.com/search?" + urlencode({"q": keyword, "f": "live"})
-        if self.site == "pixiv":
-            return "https://www.pixiv.net/users/?" + urlencode({"nick": keyword})
         if self.site == "danbooru":
             return "https://danbooru.donmai.us/posts?" + urlencode({"tags": keyword})
         if self.site == "exhentai":
@@ -486,23 +484,6 @@ def _pixiv_candidate(data: dict[str, Any]) -> tuple[dict[str, Any] | None, list[
     return candidate, [author] if author else []
 
 
-def _pixiv_user_queue(data: dict[str, Any]) -> tuple[None, list[dict[str, Any]]]:
-    user = data.get("user") if isinstance(data.get("user"), dict) else data
-    author_id = _integer(user.get("id"))
-    if author_id is None:
-        return None, []
-    profile = f"https://www.pixiv.net/users/{author_id}"
-    author = _author(
-        "pixiv",
-        author_id=author_id,
-        name=user.get("account"),
-        display_name=user.get("name"),
-        profile_url=profile,
-        works_url=f"{profile}/artworks",
-    )
-    return None, [author] if author else []
-
-
 def _danbooru_candidate(data: dict[str, Any]) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
     post_id = _integer(data.get("id"))
     if post_id is None:
@@ -721,8 +702,6 @@ def parse_discovery_output(
                 add(*_exhentai_queue_candidate(str(message[1]), message[-1]))
             elif site == "danbooru":
                 add(*_danbooru_artist_queue(str(message[1]), message[-1]))
-            elif site == "pixiv":
-                add(*_pixiv_user_queue(message[-1]))
         elif message_type == 3 and len(message) >= 3 and isinstance(message[-1], dict):
             data = message[-1]
             item_id = data.get("tweet_id") if site == "twitter" else data.get("id")

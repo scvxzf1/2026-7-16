@@ -538,46 +538,6 @@ class ApiTests(unittest.TestCase):
                     "proxy": {"used": False},
                     "attempts": 1,
                 }
-            if site == "pixiv":
-                return {
-                    "site": site,
-                    "keyword": keyword,
-                    "search_url": "https://www.pixiv.net/en/tags/artist%20name/artworks",
-                    "candidate_count": 2,
-                    "author_count": 2,
-                    "candidates": [
-                        {
-                            "id": "9990",
-                            "site": "pixiv",
-                            "kind": "work",
-                            "author": {"id": "999", "name": "fan_account"},
-                        },
-                        {
-                            "id": "770",
-                            "site": "pixiv",
-                            "kind": "work",
-                            "author": {"id": "77", "name": "artist_archive"},
-                        }
-                    ],
-                    "authors": [
-                        {
-                            "id": "999",
-                            "name": "fan_account",
-                            "display_name": "Artist Name Fan",
-                            "url": "https://www.pixiv.net/users/999",
-                            "works_url": "https://www.pixiv.net/users/999/artworks",
-                        },
-                        {
-                            "id": "77",
-                            "name": "artist_archive",
-                            "display_name": "Artist Name Archive",
-                            "url": "https://www.pixiv.net/users/77",
-                            "works_url": "https://www.pixiv.net/users/77/artworks",
-                        }
-                    ],
-                    "proxy": {"used": False},
-                    "attempts": 1,
-                }
             return {
                 "site": site,
                 "keyword": keyword,
@@ -671,10 +631,9 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(sources["twitter"]["search_strategy"], "danbooru_artist_urls")
         self.assertEqual(sources["pixiv"]["search_strategy"], "danbooru_artist_urls")
 
-    def test_cross_source_search_preserves_order_when_one_source_fails(self):
+    def test_cross_source_search_skips_native_account_lookups(self):
         async def search_side_effect(*, site, keyword, **kwargs):
-            if site == "pixiv":
-                raise DiscoveryError("extractor_error", "pixiv login expired")
+            self.assertEqual(site, "danbooru")
             return {
                 "site": site,
                 "keyword": keyword,

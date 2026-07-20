@@ -20,7 +20,7 @@
 
 ## 主要能力
 
-- 聚合搜索 X、Pixiv、Danbooru 和 E-Hentai/ExHentai，并区分已验证地址与弱证据；
+- 搜索 Danbooru 与 E-Hentai/ExHentai，并从 Danbooru 画师资料补充已验证的 X/Pixiv 账号；
 - 按来源和地址顺序执行批次，当前地址内部采用图片级并发；
 - 使用 SQLite/WAL 持久化任务、尝试、事件、日志、租约和批次进度；
 - 导入原生 HTTP/HTTPS/SOCKS 代理及常见机场订阅格式；
@@ -203,7 +203,7 @@ Pixiv OAuth 和共享 Profile 清理另有专用授权端点，可直接从 Swag
 响应按请求中的站点顺序返回 `sources[]`：
 
 - `addresses[]` 保存默认可选的已验证账号/标签地址和 EH 画廊候选；
-- `weak_evidence[]` 保存身份尚未闭环的 X/Pixiv 账号及 Danbooru 仅别名候选；
+- `weak_evidence[]` 保存 Danbooru 仅别名匹配、尚未闭环的画师候选；
 - `related_profiles` 保存 Danbooru 人工维护的其他平台主页；
 - EH 候选带标题、封面、页数和按官方 namespace 分组的 `tag_facets[]`。
 

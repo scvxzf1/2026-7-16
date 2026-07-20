@@ -74,40 +74,14 @@ class _FakeProcess:
 
 
 class DiscoveryParserTests(unittest.TestCase):
-    def test_pixiv_search_url_targets_users(self):
-        url = search_site("pixiv").search_url("这也是QAQ")
-        self.assertEqual(
-            url,
-            "https://www.pixiv.net/users/?nick=%E8%BF%99%E4%B9%9F%E6%98%AFQAQ",
-        )
-
-    def test_pixiv_user_search_queue_becomes_account_author(self):
-        stdout = json.dumps(
-            [[6, "https://www.pixiv.net/users/77/artworks", {
-                "user": {"id": 77, "account": "artist_account", "name": "这也是QAQ"}
-            }]]
-        )
-        candidates, authors = parse_discovery_output(
-            "pixiv",
-            stdout,
-            source_url="https://www.pixiv.net/users/?nick=test",
-            limit=20,
-        )
-        self.assertEqual(candidates, [])
-        self.assertEqual(authors[0]["id"], "77")
-        self.assertEqual(authors[0]["display_name"], "这也是QAQ")
-        self.assertEqual(
-            authors[0]["works_url"],
-            "https://www.pixiv.net/users/77/artworks",
-        )
-
     def test_site_aliases_and_search_urls(self):
         self.assertEqual(search_site("x").site, "twitter")
         self.assertEqual(search_site("eh").site, "exhentai")
         self.assertIn("q=clover+days", search_site("twitter").search_url("clover days"))
-        self.assertIn("nick=clover+days", search_site("pixiv").search_url("clover days"))
         self.assertIn("tags=clover_days", search_site("danbooru").search_url("clover_days"))
         self.assertIn("f_search=clover+days", search_site("exhentai").search_url("clover days"))
+        with self.assertRaises(ValueError):
+            search_site("pixiv").search_url("clover days")
 
     def test_exhentai_tag_facets_follow_official_namespaces(self):
         facets = exhentai_tag_facets(
