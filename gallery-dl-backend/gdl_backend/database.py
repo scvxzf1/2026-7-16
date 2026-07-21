@@ -180,6 +180,7 @@ class Database:
                 discovery_args_json TEXT NOT NULL DEFAULT '[]',
                 timeout_seconds REAL NOT NULL DEFAULT 180,
                 planned_task_count INTEGER NOT NULL DEFAULT 0,
+                pre_dedup_skipped_count INTEGER NOT NULL DEFAULT 0,
                 succeeded_task_count INTEGER NOT NULL DEFAULT 0,
                 failed_task_count INTEGER NOT NULL DEFAULT 0,
                 cancelled_task_count INTEGER NOT NULL DEFAULT 0,
@@ -205,6 +206,16 @@ class Database:
             );
             CREATE INDEX IF NOT EXISTS idx_crawl_address_tasks_address
                 ON crawl_address_tasks(address_id, sequence_no);
+
+            CREATE TABLE IF NOT EXISTS crawl_task_source_keys (
+                task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+                source_key TEXT NOT NULL,
+                source_url TEXT NOT NULL DEFAULT '',
+                created_at REAL NOT NULL,
+                PRIMARY KEY(task_id, source_key)
+            );
+            CREATE INDEX IF NOT EXISTS idx_crawl_task_source_keys_key
+                ON crawl_task_source_keys(source_key);
 
             CREATE TABLE IF NOT EXISTS crawl_address_proxy_probes (
                 address_id TEXT PRIMARY KEY REFERENCES crawl_addresses(id) ON DELETE CASCADE,
@@ -235,7 +246,12 @@ class Database:
                 "ALTER TABLE crawl_addresses ADD COLUMN "
                 "download_options_json TEXT NOT NULL DEFAULT '{}'"
             )
-        self._conn.execute("UPDATE meta SET value='4' WHERE key='schema_version'")
+        if "pre_dedup_skipped_count" not in address_columns:
+            self._conn.execute(
+                "ALTER TABLE crawl_addresses ADD COLUMN "
+                "pre_dedup_skipped_count INTEGER NOT NULL DEFAULT 0"
+            )
+        self._conn.execute("UPDATE meta SET value='5' WHERE key='schema_version'")
 
     @contextmanager
     def _transaction(self) -> Iterator[sqlite3.Connection]:
@@ -861,6 +877,9 @@ class Database:
                 source_index[order] = group
                 sources.append(group)
             group["addresses"].append(address)
+            group["pre_dedup_skipped_count"] = int(
+                group.get("pre_dedup_skipped_count") or 0
+            ) + int(address.get("pre_dedup_skipped_count") or 0)
             if current is None and address["status"] not in terminal:
                 current = {
                     "source_order": order,
@@ -883,6 +902,9 @@ class Database:
         batch["sources"] = sources
         batch["source_count"] = len(sources)
         batch["address_count"] = sum(len(item["addresses"]) for item in sources)
+        batch["pre_dedup_skipped_count"] = sum(
+            int(item.get("pre_dedup_skipped_count") or 0) for item in sources
+        )
         batch["current"] = current
         batch["execution_order"] = "source_then_address"
         batch["lease_model"] = "one-media-task-one-node"
@@ -1017,7 +1039,15 @@ class Database:
                 )
             return bool(cur.rowcount)
 
-    def link_crawl_task(self, address_id: str, task_id: str, sequence_no: int) -> None:
+    def link_crawl_task(
+        self,
+        address_id: str,
+        task_id: str,
+        sequence_no: int,
+        *,
+        source_key: str | None = None,
+        source_url: str | None = None,
+    ) -> None:
         now = time.time()
         with self._transaction() as conn:
             conn.execute(
@@ -1027,6 +1057,23 @@ class Database:
                 """,
                 (address_id, task_id, int(sequence_no), now),
             )
+            normalized_key = str(source_key or "").strip()
+            if normalized_key:
+                conn.execute(
+                    """
+                    INSERT INTO crawl_task_source_keys(
+                        task_id, source_key, source_url, created_at
+                    ) VALUES (?, ?, ?, ?)
+                    ON CONFLICT(task_id, source_key) DO UPDATE SET
+                        source_url=excluded.source_url
+                    """,
+                    (
+                        task_id,
+                        normalized_key[:500],
+                        str(source_url or "").strip()[:8192],
+                        now,
+                    ),
+                )
             row = conn.execute(
                 "SELECT batch_id FROM crawl_addresses WHERE id=?",
                 (address_id,),
@@ -1042,6 +1089,109 @@ class Database:
                     """,
                     (now, row["batch_id"]),
                 )
+
+    def succeeded_danbooru_source_keys(
+        self,
+        batch_id: str,
+        source_keys: list[str] | set[str] | tuple[str, ...],
+    ) -> set[str]:
+        keys = list(
+            dict.fromkeys(
+                str(value).strip() for value in source_keys if str(value).strip()
+            )
+        )
+        if not keys:
+            return set()
+        matched: set[str] = set()
+        with self._lock:
+            for offset in range(0, len(keys), 500):
+                chunk = keys[offset : offset + 500]
+                placeholders = ",".join("?" for _ in chunk)
+                rows = self._conn.execute(
+                    f"""
+                    SELECT DISTINCT ctsk.source_key
+                    FROM crawl_task_source_keys ctsk
+                    JOIN tasks t ON t.id=ctsk.task_id
+                    JOIN crawl_address_tasks cat ON cat.task_id=t.id
+                    JOIN crawl_addresses ca ON ca.id=cat.address_id
+                    WHERE ca.batch_id=? AND ca.site='danbooru'
+                        AND t.status='succeeded'
+                        AND ctsk.source_key IN ({placeholders})
+                    """,
+                    [batch_id, *chunk],
+                ).fetchall()
+                matched.update(str(row["source_key"]) for row in rows)
+        return matched
+
+    def succeeded_danbooru_source_key_count(
+        self,
+        batch_id: str,
+        target_site: str,
+    ) -> int:
+        prefix = str(target_site).strip().lower()
+        if prefix == "x":
+            prefix = "twitter"
+        if prefix not in {"pixiv", "twitter"}:
+            return 0
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT COUNT(DISTINCT ctsk.source_key)
+                FROM crawl_task_source_keys ctsk
+                JOIN tasks t ON t.id=ctsk.task_id
+                JOIN crawl_address_tasks cat ON cat.task_id=t.id
+                JOIN crawl_addresses ca ON ca.id=cat.address_id
+                WHERE ca.batch_id=? AND ca.site='danbooru'
+                    AND t.status='succeeded' AND ctsk.source_key LIKE ?
+                """,
+                (batch_id, f"{prefix}:%"),
+            ).fetchone()
+        return int(row[0] or 0)
+
+    def set_crawl_address_pre_dedup_skipped_count(
+        self,
+        address_id: str,
+        skipped_count: int,
+    ) -> bool:
+        with self._transaction() as conn:
+            cur = conn.execute(
+                """
+                UPDATE crawl_addresses SET pre_dedup_skipped_count=?, updated_at=?
+                WHERE id=? AND status='planning'
+                """,
+                (max(0, int(skipped_count)), time.time(), address_id),
+            )
+            return bool(cur.rowcount)
+
+    def finish_crawl_address_as_pre_deduplicated(
+        self,
+        address_id: str,
+        skipped_count: int,
+    ) -> bool:
+        now = time.time()
+        with self._transaction() as conn:
+            row = conn.execute(
+                """
+                SELECT ca.batch_id FROM crawl_addresses ca
+                JOIN crawl_batches cb ON cb.id=ca.batch_id
+                WHERE ca.id=? AND ca.status='planning' AND cb.cancel_requested=0
+                """,
+                (address_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            cur = conn.execute(
+                """
+                UPDATE crawl_addresses SET status='succeeded', planned_task_count=0,
+                    pre_dedup_skipped_count=?, finished_at=?, updated_at=?, last_error=''
+                WHERE id=? AND status='planning'
+                """,
+                (max(0, int(skipped_count)), now, now, address_id),
+            )
+            if not cur.rowcount:
+                return False
+            self._refresh_crawl_batch_counts(conn, str(row["batch_id"]))
+            return True
 
     def mark_crawl_address_running(self, address_id: str, *, last_error: str = "") -> bool:
         now = time.time()

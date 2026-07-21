@@ -1268,7 +1268,9 @@ function renderBatch(batch, tasks) {
     + Number(batch.failed_task_count || 0)
     + Number(batch.cancelled_task_count || 0);
   const taskCount = Number(batch.task_count || 0);
-  const percent = taskCount ? Math.min(100, Math.round((terminalCount / taskCount) * 100)) : 0;
+  const percent = taskCount
+    ? Math.min(100, Math.round((terminalCount / taskCount) * 100))
+    : (TERMINAL_BATCH.has(batch.status) ? 100 : 0);
   $("#batchProgress").style.width = `${percent}%`;
 
   const header = $("#batchHeader");
@@ -1277,6 +1279,7 @@ function renderBatch(batch, tasks) {
     stat("批次 ID", shortId(batch.id), batch.id),
     stat("当前地址", current ? `${SITE_NAMES[current.site] || current.site} · ${STATUS_NAMES[current.status] || current.status}` : "—"),
     stat("图片任务", `${terminalCount} / ${taskCount}`),
+    stat("预去重跳过", batch.pre_dedup_skipped_count || 0),
     stat("成功 / 失败 / 取消", `${batch.succeeded_task_count || 0} / ${batch.failed_task_count || 0} / ${batch.cancelled_task_count || 0}`),
     stat("图片并发", batch.concurrency ?? "—"),
   ];
@@ -1307,6 +1310,9 @@ function renderBatch(batch, tasks) {
         `成功 ${address.succeeded_task_count || 0}`,
         `失败 ${address.failed_task_count || 0}`,
       ];
+      if (address.pre_dedup_skipped_count) {
+        countParts.push(`预去重 ${address.pre_dedup_skipped_count}`);
+      }
       if (address.proxy_probed_at) {
         countParts.push(
           `代理 ${address.healthy_proxy_count || 0}/${address.probed_proxy_count || 0} 可用`,

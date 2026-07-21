@@ -22,6 +22,7 @@
 
 - 搜索 Danbooru 与 E-Hentai/ExHentai，并从 Danbooru 画师资料补充已验证的 X/Pixiv 账号；
 - 按来源和地址顺序执行批次，当前地址内部采用图片级并发；
+- 利用 Danbooru `source` 在同一批次内预去重，后续 Pixiv/X 作品在建任务前跳过；
 - 使用 SQLite/WAL 持久化任务、尝试、事件、日志、租约和批次进度；
 - 导入原生 HTTP/HTTPS/SOCKS 代理及常见机场订阅格式；
 - 通过 Mihomo 将 VLESS、VMess、Trojan、Shadowsocks、Hysteria、TUIC 等节点桥接为本地 HTTP 出口；
@@ -262,6 +263,7 @@ Pixiv OAuth 和共享 Profile 清理另有专用授权端点，可直接从 Swag
 来源和地址顺序串行推进，只有当前地址内部的图片任务并发。每个新地址开始前会进行一次
 站点探活，并把通过节点集合持久化；该地址的规划与下载只从此集合取得租约。`concurrency`
 还受全局调度上限限制，`max_tasks` 限制整个批次的媒体任务规模。
+地址详情中的 `pre_dedup_skipped_count` 记录在建立任务前按来源键跳过的媒体任务数；这些项不会进入 `task_count` 或任务列表。
 
 EH/EHX 来源的 `eh_download.image_mode` 接受 `original` 或 `resample`。原图模式下，
 `gp_policy=stop` 保持严格原图并在 GP 响应时停止，`gp_policy=resized` 允许 gallery-dl

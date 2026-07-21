@@ -213,6 +213,90 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(self.db.recover_ordered_crawls(), 1)
         self.assertEqual(self.db.next_crawl_address("batch-recovery")["status"], "pending")
 
+    def test_pre_dedup_uses_only_successful_danbooru_tasks_in_the_same_batch(self):
+        self.db.create_crawl_batch(
+            {
+                "id": "batch-dedup",
+                "output_dir": str(self.root / "batch"),
+                "concurrency": 20,
+                "max_tasks": 100,
+            },
+            [
+                {
+                    "id": "address-danbooru",
+                    "site": "danbooru",
+                    "source_order": 0,
+                    "address_order": 0,
+                    "url": "https://danbooru.donmai.us/posts?tags=a",
+                    "proxy_mode": "direct",
+                    "max_attempts": 3,
+                },
+                {
+                    "id": "address-pixiv",
+                    "site": "pixiv",
+                    "source_order": 1,
+                    "address_order": 0,
+                    "url": "https://www.pixiv.net/users/1/artworks",
+                    "proxy_mode": "direct",
+                    "max_attempts": 3,
+                },
+            ],
+        )
+        self.assertTrue(self.db.begin_crawl_address_planning("address-danbooru"))
+        for task_id, source_key, status in (
+            ("dan-success", "pixiv:100", "succeeded"),
+            ("dan-failed", "twitter:200", "failed"),
+        ):
+            self.db.create_task(
+                {
+                    **task_values(self.root),
+                    "id": task_id,
+                    "site": "danbooru",
+                    "url": f"https://danbooru.donmai.us/posts/{task_id}",
+                }
+            )
+            self.db.link_crawl_task(
+                "address-danbooru",
+                task_id,
+                1 if status == "succeeded" else 2,
+                source_key=source_key,
+                source_url="https://SOURCE",
+            )
+            self.db.complete_task(task_id, status)
+        self.assertTrue(self.db.mark_crawl_address_running("address-danbooru"))
+        self.assertEqual(
+            self.db.succeeded_danbooru_source_keys(
+                "batch-dedup",
+                {"pixiv:100", "twitter:200", "pixiv:300"},
+            ),
+            {"pixiv:100"},
+        )
+        self.assertEqual(
+            self.db.succeeded_danbooru_source_keys("other-batch", {"pixiv:100"}),
+            set(),
+        )
+        self.assertEqual(
+            self.db.succeeded_danbooru_source_key_count("batch-dedup", "pixiv"),
+            1,
+        )
+        self.assertEqual(
+            self.db.succeeded_danbooru_source_key_count("batch-dedup", "twitter"),
+            0,
+        )
+
+        self.assertTrue(self.db.finish_crawl_address_if_terminal("address-danbooru"))
+        self.assertTrue(self.db.begin_crawl_address_planning("address-pixiv"))
+        self.assertTrue(
+            self.db.finish_crawl_address_as_pre_deduplicated("address-pixiv", 3)
+        )
+        self.assertTrue(self.db.finish_crawl_batch_if_ready("batch-dedup"))
+        batch = self.db.get_crawl_batch("batch-dedup")
+        pixiv = batch["sources"][1]["addresses"][0]
+        self.assertEqual(pixiv["status"], "succeeded")
+        self.assertEqual(pixiv["planned_task_count"], 0)
+        self.assertEqual(pixiv["pre_dedup_skipped_count"], 3)
+        self.assertEqual(batch["pre_dedup_skipped_count"], 3)
+
     def test_ordered_crawl_recovery_drains_partially_linked_address(self):
         self.db.create_crawl_batch(
             {
@@ -254,6 +338,7 @@ class DatabaseTests(unittest.TestCase):
         with legacy._transaction() as conn:
             conn.execute("DROP TABLE crawl_address_proxy_nodes")
             conn.execute("DROP TABLE crawl_address_proxy_probes")
+            conn.execute("DROP TABLE crawl_task_source_keys")
             conn.execute("DROP TABLE crawl_address_tasks")
             conn.execute("DROP TABLE crawl_addresses")
             conn.execute("DROP TABLE crawl_batches")
@@ -277,13 +362,15 @@ class DatabaseTests(unittest.TestCase):
                     "PRAGMA table_info(crawl_addresses)"
                 ).fetchall()
             }
-            self.assertEqual(version, "4")
+            self.assertEqual(version, "5")
             self.assertIn("download_options_json", address_columns)
+            self.assertIn("pre_dedup_skipped_count", address_columns)
             self.assertTrue(
                 {
                     "crawl_batches",
                     "crawl_addresses",
                     "crawl_address_tasks",
+                    "crawl_task_source_keys",
                     "crawl_address_proxy_probes",
                     "crawl_address_proxy_nodes",
                 }.issubset(tables)

@@ -16,6 +16,7 @@ from .classifier import classify_result
 from .proxy import ProxyLease, ProxyPoolAdapter
 from .redaction import redact_text
 from .schemas import ProxyMode, SitePolicy
+from .source_keys import candidate_source_key, source_key_from_url
 
 
 _EH_GALLERY_RE = re.compile(
@@ -43,6 +44,8 @@ class CrawlUnit:
     kind: str
     source_id: str
     extra_args: list[str] = field(default_factory=list)
+    source_key: str | None = None
+    source_url: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -51,6 +54,8 @@ class CrawlUnit:
             "kind": self.kind,
             "source_id": self.source_id,
             "extra_args": list(self.extra_args),
+            "source_key": self.source_key,
+            "source_url": self.source_url,
         }
 
 
@@ -110,6 +115,20 @@ class CrawlPlanner:
             source_id = str(item.get("id") or uuid.uuid5(uuid.NAMESPACE_URL, url))
             kind = str(item.get("kind") or "candidate")
             item_args = [str(value) for value in item.get("extra_args") or []]
+            metadata = (
+                item.get("metadata")
+                if isinstance(item.get("metadata"), dict)
+                else {}
+            )
+            raw_source_value = item.get("source_url")
+            if site == "danbooru" and not raw_source_value:
+                raw_source_value = metadata.get("source_url") or metadata.get("source")
+            raw_source_url = str(raw_source_value or "").strip() or None
+            if site == "danbooru":
+                source_key = source_key_from_url(raw_source_url)
+            else:
+                source_key = candidate_source_key(site, item.get("id"), url)
+                raw_source_url = raw_source_url or url
             if not url:
                 raise CrawlPlanError("invalid_crawl_item", "爬取候选缺少 URL")
 
@@ -152,10 +171,22 @@ class CrawlPlanner:
                                 "media",
                                 f"{source_id}:{index}",
                                 list(item_args),
+                                source_key,
+                                raw_source_url,
                             )
                         )
                 elif count == 1:
-                    units.append(CrawlUnit(url, site, kind, source_id, item_args))
+                    units.append(
+                        CrawlUnit(
+                            url,
+                            site,
+                            kind,
+                            source_id,
+                            item_args,
+                            source_key,
+                            raw_source_url,
+                        )
+                    )
                 else:
                     for index in range(1, count + 1):
                         units.append(
@@ -165,6 +196,8 @@ class CrawlPlanner:
                                 "media",
                                 f"{source_id}:{index}",
                                 [*item_args, "--range", str(index)],
+                                source_key,
+                                raw_source_url,
                             )
                         )
             if len(units) > max_tasks:

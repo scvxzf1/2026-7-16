@@ -504,6 +504,7 @@ def _danbooru_candidate(data: dict[str, Any]) -> tuple[dict[str, Any] | None, li
             authors.append(item)
     work_url = f"https://danbooru.donmai.us/posts/{post_id}"
     copyrights = _list(data.get("tags_copyright") or data.get("tag_string_copyright"), 10)
+    source_url = _text(data.get("source"), 8192)
     candidate = {
         "id": str(post_id),
         "site": "danbooru",
@@ -511,11 +512,12 @@ def _danbooru_candidate(data: dict[str, Any]) -> tuple[dict[str, Any] | None, li
         "title": " / ".join(copyrights) or f"Post {post_id}",
         "url": work_url,
         "download_url": work_url,
+        "source_url": source_url,
         "thumbnail_url": _text(
             data.get("preview_file_url")
             or data.get("large_file_url")
             or data.get("file_url")
-            or data.get("source"),
+            or source_url,
             8192,
         ),
         "media_count": 1,

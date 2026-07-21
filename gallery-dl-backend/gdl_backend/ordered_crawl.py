@@ -14,6 +14,7 @@ from .proxy import ProxyPoolAdapter
 from .redaction import redact_text
 from .scheduler import TaskScheduler
 from .schemas import SitePolicy, TaskCreate, TaskPolicy
+from .source_keys import candidate_source_key
 
 
 EnqueueTask = Callable[
@@ -157,9 +158,25 @@ class OrderedCrawlManager:
             latest = self.db.get_crawl_batch(batch["id"])
             if latest is None or latest["cancel_requested"]:
                 return
-            units = await self._plan_address(address, policy=policy, max_tasks=remaining)
+            units, skipped_count = await self._plan_address(
+                address,
+                batch_id=batch["id"],
+                policy=policy,
+                max_tasks=remaining,
+            )
+            self.db.set_crawl_address_pre_dedup_skipped_count(
+                address["id"],
+                skipped_count,
+            )
             deduplicated = self._deduplicate(units)
             if not deduplicated:
+                if skipped_count and self.db.finish_crawl_address_as_pre_deduplicated(
+                    address["id"],
+                    skipped_count,
+                ):
+                    self.db.finish_crawl_batch_if_ready(batch["id"])
+                    self.notify()
+                    return
                 raise CrawlPlanError("empty_crawl_plan", "该地址没有发现可下载图片")
             if len(deduplicated) > remaining:
                 raise CrawlPlanError(
@@ -204,7 +221,13 @@ class OrderedCrawlManager:
                     int(batch["concurrency"]),
                 )
                 linked_tasks.append(task["id"])
-                self.db.link_crawl_task(address["id"], task["id"], sequence_no)
+                self.db.link_crawl_task(
+                    address["id"],
+                    task["id"],
+                    sequence_no,
+                    source_key=unit.source_key,
+                    source_url=unit.source_url,
+                )
             latest = self.db.get_crawl_batch(batch["id"])
             if latest is None or latest["cancel_requested"]:
                 await cancel_linked()
@@ -318,9 +341,10 @@ class OrderedCrawlManager:
         self,
         address: dict,
         *,
+        batch_id: str,
         policy: SitePolicy,
         max_tasks: int,
-    ) -> list[CrawlUnit]:
+    ) -> tuple[list[CrawlUnit], int]:
         site = str(address["site"])
         mode = address["proxy_mode"]
         if site == "exhentai":
@@ -333,13 +357,17 @@ class OrderedCrawlManager:
                 }
             ]
         else:
+            dedup_scan_allowance = self.db.succeeded_danbooru_source_key_count(
+                batch_id,
+                site,
+            )
             result = await self.discovery.discover_url(
                 site=site,
                 url=address["url"],
                 keyword=None,
                 # Ask for one extra post/work so the task ceiling becomes an explicit
                 # error instead of a silently truncated account or tag crawl.
-                limit=max_tasks + 1,
+                limit=max_tasks + dedup_scan_allowance + 1,
                 range_kind=None,
                 policy=policy,
                 proxy_mode=mode,
@@ -355,6 +383,11 @@ class OrderedCrawlManager:
                     "address_empty",
                     f"该地址没有发现作品: {address['url']}",
                 )
+        candidates, skipped_count = self._filter_previously_downloaded_danbooru_sources(
+            batch_id,
+            site,
+            candidates,
+        )
         units, _planner_proxies = await self.planner.plan_media(
             candidates,
             policy=policy,
@@ -362,7 +395,45 @@ class OrderedCrawlManager:
             cookies_file=address.get("cookies_file"),
             max_tasks=max_tasks,
         )
-        return units
+        return units, skipped_count
+
+    def _filter_previously_downloaded_danbooru_sources(
+        self,
+        batch_id: str,
+        site: str,
+        candidates: list[dict],
+    ) -> tuple[list[dict], int]:
+        normalized_site = "twitter" if site == "x" else site
+        if normalized_site not in {"pixiv", "twitter"}:
+            return candidates, 0
+        keyed = [
+            (
+                item,
+                candidate_source_key(
+                    normalized_site,
+                    item.get("id"),
+                    item.get("download_url") or item.get("works_url") or item.get("url"),
+                ),
+            )
+            for item in candidates
+        ]
+        matched = self.db.succeeded_danbooru_source_keys(
+            batch_id,
+            {key for _item, key in keyed if key},
+        )
+        if not matched:
+            return candidates, 0
+        kept: list[dict] = []
+        skipped_count = 0
+        for item, key in keyed:
+            if key not in matched:
+                kept.append(item)
+                continue
+            try:
+                skipped_count += max(1, int(item.get("media_count") or 1))
+            except (TypeError, ValueError):
+                skipped_count += 1
+        return kept, skipped_count
 
     @staticmethod
     def _deduplicate(units: list[CrawlUnit]) -> list[tuple[CrawlUnit, str]]:

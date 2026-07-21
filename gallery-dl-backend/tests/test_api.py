@@ -874,6 +874,162 @@ class ApiTests(unittest.TestCase):
             ],
         )
 
+    def test_ordered_crawl_pre_deduplicates_pixiv_and_twitter_from_danbooru(self):
+        import asyncio
+
+        discovery_limits = []
+
+        async def discover(*, site, **_kwargs):
+            limit = int(_kwargs["limit"])
+            discovery_limits.append((site, limit))
+            if site == "danbooru":
+                candidates = [
+                    {
+                        "id": "10",
+                        "site": "danbooru",
+                        "kind": "post",
+                        "url": "https://danbooru.donmai.us/posts/10",
+                        "source_url": (
+                            "https://www.pixiv.net/member_illust.php?"
+                            "mode=medium&illust_id=100"
+                        ),
+                        "media_count": 1,
+                    },
+                    {
+                        "id": "11",
+                        "site": "danbooru",
+                        "kind": "post",
+                        "url": "https://danbooru.donmai.us/posts/11",
+                        "source_url": "https://www.pixiv.net/artworks/101",
+                        "media_count": 1,
+                    },
+                    {
+                        "id": "12",
+                        "site": "danbooru",
+                        "kind": "post",
+                        "url": "https://danbooru.donmai.us/posts/12",
+                        "source_url": (
+                            "https://i.pximg.net/img-original/img/2026/01/02/"
+                            "03/04/05/102_p0.png"
+                        ),
+                        "media_count": 1,
+                    },
+                    {
+                        "id": "13",
+                        "site": "danbooru",
+                        "kind": "post",
+                        "url": "https://danbooru.donmai.us/posts/13",
+                        "source_url": "https://twitter.com/artist/status/200",
+                        "media_count": 1,
+                    },
+                ]
+                return {"candidates": candidates[:limit]}
+            if site == "pixiv":
+                candidates = [
+                    {
+                        "id": "100",
+                        "site": "pixiv",
+                        "kind": "work",
+                        "url": "https://www.pixiv.net/artworks/100",
+                        "media_count": 2,
+                    },
+                    {
+                        "id": "101",
+                        "site": "pixiv",
+                        "kind": "work",
+                        "url": "https://www.pixiv.net/artworks/101",
+                        "media_count": 1,
+                    },
+                    {
+                        "id": "102",
+                        "site": "pixiv",
+                        "kind": "work",
+                        "url": "https://www.pixiv.net/artworks/102",
+                        "media_count": 1,
+                    },
+                    {
+                        "id": "103",
+                        "site": "pixiv",
+                        "kind": "work",
+                        "url": "https://www.pixiv.net/artworks/103",
+                        "media_count": 1,
+                    },
+                ]
+                return {"candidates": candidates[:limit]}
+            candidates = [
+                {
+                    "id": "200",
+                    "site": "twitter",
+                    "kind": "work",
+                    "url": "https://x.com/artist/status/200",
+                    "media_count": 1,
+                }
+            ]
+            return {"candidates": candidates[:limit]}
+
+        self.container.discovery.discover_url = AsyncMock(side_effect=discover)
+        response = self.client.post(
+            "/api/v1/crawls",
+            headers=self.headers,
+            json={
+                "sources": [
+                    {
+                        "site": "danbooru",
+                        "addresses": [
+                            {"url": "https://danbooru.donmai.us/posts?tags=artist"}
+                        ],
+                    },
+                    {
+                        "site": "pixiv",
+                        "addresses": [
+                            {"url": "https://www.pixiv.net/users/1/artworks"}
+                        ],
+                    },
+                    {
+                        "site": "twitter",
+                        "addresses": [{"url": "https://x.com/artist/media"}],
+                    },
+                ],
+                "max_tasks": 6,
+                "proxy_mode": "direct",
+            },
+        )
+        self.assertEqual(response.status_code, 202, response.text)
+        batch_id = response.json()["id"]
+
+        asyncio.run(self.container.ordered_crawls.run_once())
+        danbooru_tasks = self.container.db.list_crawl_tasks(batch_id)
+        self.assertEqual(len(danbooru_tasks), 4)
+        for task in danbooru_tasks:
+            self.container.db.complete_task(task["id"], "succeeded")
+
+        asyncio.run(self.container.ordered_crawls.run_once())
+        asyncio.run(self.container.ordered_crawls.run_once())
+        batch = self.container.db.get_crawl_batch(batch_id)
+        pixiv = batch["sources"][1]["addresses"][0]
+        self.assertEqual(pixiv["status"], "running")
+        self.assertEqual(pixiv["planned_task_count"], 1)
+        self.assertEqual(pixiv["pre_dedup_skipped_count"], 4)
+        tasks = self.container.db.list_crawl_tasks(batch_id)
+        self.assertEqual(len(tasks), 5)
+        self.assertEqual(tasks[-1]["url"], "https://www.pixiv.net/artworks/103")
+        self.container.db.complete_task(tasks[-1]["id"], "succeeded")
+
+        asyncio.run(self.container.ordered_crawls.run_once())
+        asyncio.run(self.container.ordered_crawls.run_once())
+        batch = self.container.db.get_crawl_batch(batch_id)
+        twitter = batch["sources"][2]["addresses"][0]
+        self.assertEqual(batch["status"], "succeeded")
+        self.assertEqual(batch["task_count"], 5)
+        self.assertEqual(batch["pre_dedup_skipped_count"], 5)
+        self.assertEqual(twitter["status"], "succeeded")
+        self.assertEqual(twitter["planned_task_count"], 0)
+        self.assertEqual(twitter["pre_dedup_skipped_count"], 1)
+        self.assertEqual(
+            discovery_limits,
+            [("danbooru", 7), ("pixiv", 6), ("twitter", 3)],
+        )
+
     def test_required_crawl_stops_before_planning_when_site_probe_has_no_nodes(self):
         import asyncio
 

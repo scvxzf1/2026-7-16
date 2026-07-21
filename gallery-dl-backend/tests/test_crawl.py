@@ -24,6 +24,7 @@ class CrawlPlannerTests(unittest.TestCase):
                 "site": "danbooru",
                 "kind": "post",
                 "url": "https://danbooru.donmai.us/posts/2",
+                "source_url": "https://twitter.com/artist/status/22",
                 "media_count": 1,
             },
         ]
@@ -40,6 +41,9 @@ class CrawlPlannerTests(unittest.TestCase):
         self.assertEqual(units[0].extra_args, ["--range", "1"])
         self.assertEqual(units[2].extra_args, ["--range", "3"])
         self.assertEqual(units[3].extra_args, [])
+        self.assertEqual([unit.source_key for unit in units[:3]], ["pixiv:1"] * 3)
+        self.assertEqual(units[3].source_key, "twitter:22")
+        self.assertEqual(units[3].source_url, "https://twitter.com/artist/status/22")
         self.assertEqual(proxies, [])
 
         with self.assertRaises(CrawlPlanError):

@@ -237,6 +237,7 @@ class DiscoveryParserTests(unittest.TestCase):
                     "tags_artist": ["artist_name"],
                     "tags_copyright": ["clover_days"],
                     "preview_file_url": "https://cdn.donmai.us/preview.jpg",
+                    "source": "https://www.pixiv.net/artworks/9988",
                     "rating": "g",
                 },
             ]
@@ -248,6 +249,7 @@ class DiscoveryParserTests(unittest.TestCase):
             limit=20,
         )
         self.assertEqual(candidates[0]["url"], "https://danbooru.donmai.us/posts/123")
+        self.assertEqual(candidates[0]["source_url"], "https://www.pixiv.net/artworks/9988")
         self.assertIn("tags=artist_name", authors[0]["works_url"])
 
         artist_queue = [
