@@ -192,6 +192,7 @@ class OrderedCrawlManager:
                     credentials_ref=address.get("credentials_ref"),
                     cookies_file=None if direct_twitter_media else address.get("cookies_file"),
                     config_file=address.get("config_file"),
+                    eh_download=(address.get("download_options") or {}).get("eh"),
                     extra_args=[*address.get("extra_args", []), *unit.extra_args],
                 )
                 task_body._policy_override = policy

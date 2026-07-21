@@ -175,6 +175,7 @@ class Database:
                 credentials_ref TEXT,
                 cookies_file TEXT,
                 config_file TEXT,
+                download_options_json TEXT NOT NULL DEFAULT '{}',
                 extra_args_json TEXT NOT NULL DEFAULT '[]',
                 discovery_args_json TEXT NOT NULL DEFAULT '[]',
                 timeout_seconds REAL NOT NULL DEFAULT 180,
@@ -225,6 +226,16 @@ class Database:
             UPDATE meta SET value='3' WHERE key='schema_version';
             """
         )
+        address_columns = {
+            str(row["name"])
+            for row in self._conn.execute("PRAGMA table_info(crawl_addresses)").fetchall()
+        }
+        if "download_options_json" not in address_columns:
+            self._conn.execute(
+                "ALTER TABLE crawl_addresses ADD COLUMN "
+                "download_options_json TEXT NOT NULL DEFAULT '{}'"
+            )
+        self._conn.execute("UPDATE meta SET value='4' WHERE key='schema_version'")
 
     @contextmanager
     def _transaction(self) -> Iterator[sqlite3.Connection]:
@@ -278,12 +289,16 @@ class Database:
         if row is None:
             return None
         data = dict(row)
-        for key in ("extra_args_json", "discovery_args_json"):
+        for key, default in (
+            ("download_options_json", {}),
+            ("extra_args_json", []),
+            ("discovery_args_json", []),
+        ):
             target = key.removesuffix("_json")
             try:
-                data[target] = json.loads(data.pop(key) or "[]")
+                data[target] = json.loads(data.pop(key) or "null")
             except Exception:
-                data[target] = []
+                data[target] = default
                 data.pop(key, None)
         return data
 
@@ -765,9 +780,10 @@ class Database:
                     INSERT INTO crawl_addresses(
                         id, batch_id, site, source_order, address_order, url, label,
                         address_type, status, proxy_mode, max_attempts, priority,
-                        credentials_ref, cookies_file, config_file, extra_args_json,
-                        discovery_args_json, timeout_seconds, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        credentials_ref, cookies_file, config_file, download_options_json,
+                        extra_args_json, discovery_args_json, timeout_seconds, created_at,
+                        updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         address["id"],
@@ -784,6 +800,7 @@ class Database:
                         address.get("credentials_ref"),
                         address.get("cookies_file"),
                         address.get("config_file"),
+                        json.dumps(address.get("download_options", {}), ensure_ascii=False),
                         json.dumps(address.get("extra_args", []), ensure_ascii=False),
                         json.dumps(address.get("discovery_args", []), ensure_ascii=False),
                         float(address.get("timeout_seconds", 180.0)),

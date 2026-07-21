@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, Mock, patch
 from fastapi.testclient import TestClient
 
 from gdl_backend.app import ServiceContainer, _validate_network_target, create_app
+from gdl_backend.crawl import CrawlUnit
 from gdl_backend.discovery import DiscoveryError
 
 from tests.helpers import make_settings
@@ -47,6 +48,9 @@ class ApiTests(unittest.TestCase):
         self.assertIn('id="startPixivOAuth"', index.text)
         self.assertIn('id="cancelPixivOAuth"', index.text)
         self.assertIn('id="clearAuthBrowserProfile"', index.text)
+        self.assertIn('id="ehDownloadOptions"', index.text)
+        self.assertIn('name="ehImageMode"', index.text)
+        self.assertIn('id="ehGpPolicy"', index.text)
         self.assertIn("删除导出凭证", index.text)
         self.assertIn("X、Pixiv 与 EH 共用同一个项目授权 Chrome Profile", index.text)
         self.assertNotIn('id="apiKey"', index.text)
@@ -68,6 +72,8 @@ class ApiTests(unittest.TestCase):
         self.assertIn("ehEntryMatchesTagFilter", script.text)
         self.assertIn("eh-tag-option", script.text)
         self.assertIn("keyword_gallery_search", script.text)
+        self.assertIn("eh_download", script.text)
+        self.assertIn("ehDownloadOptions", script.text)
         self.assertIn("/api/v1/auth", script.text)
         self.assertIn("startManagedBrowserLogin", script.text)
         self.assertIn("scheduleBrowserLoginPoll", script.text)
@@ -85,6 +91,8 @@ class ApiTests(unittest.TestCase):
         self.assertIn(".eh-tag-option.exclude", styles.text)
         self.assertIn(".auth-center", styles.text)
         self.assertIn(".oauth-panel", styles.text)
+        self.assertIn(".segmented-control", styles.text)
+        self.assertIn(".eh-download-options", styles.text)
 
     def test_managed_auth_api_contract(self):
         listing = self.client.get("/api/v1/auth")
@@ -924,6 +932,93 @@ class ApiTests(unittest.TestCase):
         )
         self.assertEqual(invalid_eh.status_code, 422, invalid_eh.text)
         self.assertEqual(invalid_eh.json()["error"]["code"], "invalid_crawl")
+
+    def test_eh_download_options_are_persisted_and_reach_media_tasks(self):
+        import asyncio
+
+        self.container.crawl_planner.plan_media = AsyncMock(
+            return_value=(
+                [
+                    CrawlUnit(
+                        "https://e-hentai.org/s/aaaaaaaaaa/123-1",
+                        "exhentai",
+                        "media",
+                        "123:1",
+                        ["--range", "1"],
+                    )
+                ],
+                [],
+            )
+        )
+        response = self.client.post(
+            "/api/v1/crawls",
+            headers=self.headers,
+            json={
+                "sources": [
+                    {
+                        "site": "eh",
+                        "addresses": [
+                            {"url": "https://e-hentai.org/g/123/cccccccccc/"}
+                        ],
+                        "eh_download": {
+                            "image_mode": "original",
+                            "gp_policy": "stop",
+                        },
+                    }
+                ],
+                "proxy_mode": "direct",
+            },
+        )
+        self.assertEqual(response.status_code, 202, response.text)
+        batch_id = response.json()["id"]
+        address = response.json()["sources"][0]["addresses"][0]
+        self.assertEqual(
+            address["download_options"],
+            {"eh": {"image_mode": "original", "gp_policy": "stop"}},
+        )
+
+        asyncio.run(self.container.ordered_crawls.run_once())
+        tasks = self.container.db.list_crawl_tasks(batch_id)
+        self.assertEqual(len(tasks), 1)
+        self.assertEqual(
+            tasks[0]["policy"]["eh_download"],
+            {"image_mode": "original", "gp_policy": "stop"},
+        )
+        self.assertEqual(tasks[0]["extra_args"], ["--range", "1"])
+
+        wrong_site = self.client.post(
+            "/api/v1/crawls",
+            headers=self.headers,
+            json={
+                "sources": [
+                    {
+                        "site": "twitter",
+                        "addresses": [{"url": "https://x.com/example/media"}],
+                        "eh_download": {"image_mode": "original"},
+                    }
+                ],
+                "proxy_mode": "direct",
+            },
+        )
+        self.assertEqual(wrong_site.status_code, 422, wrong_site.text)
+        self.assertEqual(wrong_site.json()["error"]["code"], "invalid_crawl")
+
+        invalid_mode = self.client.post(
+            "/api/v1/crawls",
+            headers=self.headers,
+            json={
+                "sources": [
+                    {
+                        "site": "eh",
+                        "addresses": [
+                            {"url": "https://e-hentai.org/g/123/cccccccccc/"}
+                        ],
+                        "eh_download": {"image_mode": "archive"},
+                    }
+                ]
+            },
+        )
+        self.assertEqual(invalid_mode.status_code, 422, invalid_mode.text)
 
     def test_partial_enqueue_drains_current_address_before_next_address(self):
         import asyncio

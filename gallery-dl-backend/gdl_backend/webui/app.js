@@ -1055,9 +1055,26 @@ function selectedAddressCount() {
   return state.sources.reduce((sum, source) => sum + source.addresses.filter((item) => item.selected).length, 0);
 }
 
+function ehDownloadOptions() {
+  const imageMode = $('input[name="ehImageMode"]:checked')?.value || "original";
+  return {
+    image_mode: imageMode,
+    gp_policy: $("#ehGpPolicy").value,
+  };
+}
+
+function syncEhDownloadControls() {
+  const original = ehDownloadOptions().image_mode === "original";
+  $("#ehGpPolicy").disabled = !original;
+  $("#ehGpField").classList.toggle("disabled", !original);
+}
+
 function updateSelection() {
   const addresses = selectedAddressCount();
   const sources = state.sources.filter((source) => source.addresses.some((item) => item.selected)).length;
+  const ehAddresses = state.sources
+    .filter((source) => source.site === "exhentai")
+    .reduce((sum, source) => sum + source.addresses.filter((item) => item.selected).length, 0);
   const hiddenSelected = state.sources.reduce(
     (sum, source) => sum + source.addresses.filter(
       (item) => item.selected && !entryVisible(source, item),
@@ -1067,8 +1084,11 @@ function updateSelection() {
   $("#selectionCount").textContent = hiddenSelected
     ? `已选 ${sources} 个来源 / ${addresses} 个地址（筛选外 ${hiddenSelected}）`
     : `已选 ${sources} 个来源 / ${addresses} 个地址`;
+  $("#ehDownloadOptions").classList.toggle("hidden", ehAddresses === 0);
+  syncEhDownloadControls();
+  const ehMode = ehDownloadOptions().image_mode === "original" ? "EH 原图" : "EH 1280";
   $("#crawlHint").textContent = addresses
-    ? `将按当前顺序执行 ${sources} 个来源、${addresses} 个地址。`
+    ? `将按当前顺序执行 ${sources} 个来源、${addresses} 个地址${ehAddresses ? `；${ehMode}` : ""}。`
     : "先勾选至少一个图库地址。";
   $("#startCrawl").disabled = addresses === 0;
 }
@@ -1086,7 +1106,9 @@ function buildCrawlPayload() {
         url: item.data.url,
       }));
     if (!addresses.length) return;
-    sources.push({ site: source.site, addresses, ...(options[source.site] || {}) });
+    const sourcePayload = { site: source.site, addresses, ...(options[source.site] || {}) };
+    if (source.site === "exhentai") sourcePayload.eh_download = ehDownloadOptions();
+    sources.push(sourcePayload);
   });
   if (!sources.length) throw new Error("至少选择一个图库地址。");
   const payload = {
@@ -1411,6 +1433,10 @@ function bindEvents() {
     $("#ehTagQuery").value = "";
     renderSearchResults();
   });
+  $$('input[name="ehImageMode"]').forEach((element) => {
+    element.addEventListener("change", updateSelection);
+  });
+  $("#ehGpPolicy").addEventListener("change", updateSelection);
   $("#startCrawl").addEventListener("click", startCrawl);
   $("#refreshBatch").addEventListener("click", refreshActiveBatch);
   $("#cancelBatch").addEventListener("click", cancelActiveBatch);

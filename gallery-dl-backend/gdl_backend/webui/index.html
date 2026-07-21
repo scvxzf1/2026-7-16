@@ -217,6 +217,31 @@
           </div>
           <strong id="selectionCount" class="selection-count">已选 0 个地址</strong>
         </div>
+        <fieldset id="ehDownloadOptions" class="eh-download-options hidden">
+          <legend>EH 下载</legend>
+          <div class="eh-download-grid">
+            <div class="field">
+              <span id="ehImageModeLabel">图片版本</span>
+              <div class="segmented-control" role="group" aria-labelledby="ehImageModeLabel">
+                <label class="segmented-option">
+                  <input type="radio" name="ehImageMode" value="original" checked>
+                  <span>原图</span>
+                </label>
+                <label class="segmented-option">
+                  <input type="radio" name="ehImageMode" value="resample">
+                  <span>1280</span>
+                </label>
+              </div>
+            </div>
+            <label id="ehGpField" class="field">
+              <span>GP 响应</span>
+              <select id="ehGpPolicy">
+                <option value="stop" selected>严格原图（失败即停止）</option>
+                <option value="resized">允许降级到 1280</option>
+              </select>
+            </label>
+          </div>
+        </fieldset>
         <div class="crawl-config-grid">
           <label class="field">
             <span>单地址图片并发</span>

@@ -47,6 +47,7 @@ from .schemas import (
     SearchRequest,
     SitePolicy,
     TaskCreate,
+    TaskPolicy,
 )
 from .site import SiteResolver
 
@@ -498,6 +499,15 @@ def create_app(
             else:
                 site = site_info.site
             policy = body._policy_override or container.policy_for(site)
+            if body.eh_download is not None:
+                if site != "exhentai":
+                    raise ValueError("eh_download 仅适用于 EH/EHX 任务")
+                policy = TaskPolicy.model_validate(
+                    {
+                        **policy.model_dump(),
+                        "eh_download": body.eh_download.model_dump(),
+                    }
+                )
             if concurrency_override is not None:
                 effective = min(
                     int(concurrency_override),
@@ -1061,6 +1071,13 @@ def create_app(
             flattened: list[dict[str, Any]] = []
             for source_order, (site, source) in enumerate(canonical_sources):
                 policy = container.policy_for(site)
+                if source.eh_download is not None and site != "exhentai":
+                    raise ValueError("eh_download 仅适用于 EH/EHX 来源")
+                download_options = (
+                    {"eh": source.eh_download.model_dump()}
+                    if source.eh_download is not None
+                    else {}
+                )
 
                 def source_value(name: str):
                     if name in source.model_fields_set:
@@ -1128,6 +1145,7 @@ def create_app(
                             "credentials_ref": credentials_ref,
                             "cookies_file": str(cookies) if cookies else None,
                             "config_file": str(config_file) if config_file else None,
+                            "download_options": download_options,
                             "extra_args": address_args,
                             "discovery_args": discovery_args,
                             "timeout_seconds": timeout_seconds,

@@ -117,6 +117,9 @@ class DatabaseTests(unittest.TestCase):
                 "url": "https://x.com/a/media",
                 "proxy_mode": "required",
                 "max_attempts": 3,
+                "download_options": {
+                    "eh": {"image_mode": "original", "gp_policy": "stop"}
+                },
             },
             {
                 "id": "address-2",
@@ -162,6 +165,10 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(probe["node_ids"], ["node-a", "node-b"])
         batch = self.db.get_crawl_batch(batch_id)
         first_address = batch["sources"][0]["addresses"][0]
+        self.assertEqual(
+            first_address["download_options"],
+            {"eh": {"image_mode": "original", "gp_policy": "stop"}},
+        )
         self.assertEqual(first_address["proxy_probe_target"], "https://x.com/")
         self.assertEqual(first_address["probed_proxy_count"], 3)
         self.assertEqual(first_address["healthy_proxy_count"], 2)
@@ -264,7 +271,14 @@ class DatabaseTests(unittest.TestCase):
                     "SELECT name FROM sqlite_master WHERE type='table'"
                 ).fetchall()
             }
-            self.assertEqual(version, "3")
+            address_columns = {
+                row[1]
+                for row in upgraded._conn.execute(
+                    "PRAGMA table_info(crawl_addresses)"
+                ).fetchall()
+            }
+            self.assertEqual(version, "4")
+            self.assertIn("download_options_json", address_columns)
             self.assertTrue(
                 {
                     "crawl_batches",

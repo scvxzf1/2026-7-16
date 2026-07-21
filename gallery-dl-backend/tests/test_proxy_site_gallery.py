@@ -16,6 +16,7 @@ from gdl_backend.gallery import GalleryRunner
 from gdl_backend.proxy import ProxyPoolAdapter
 from gdl_backend.proxy_runtime import LocalHTTPForwarder, _connect_response_succeeded
 from gdl_backend.proxy_sources import parse_subscription_text
+from gdl_backend.schemas import EHDownloadOptions
 from gdl_backend.site import SiteResolver
 
 from tests.helpers import WORKSPACE, make_settings
@@ -84,6 +85,42 @@ class SiteAndGalleryTests(unittest.TestCase):
                 extra_args=[],
             )
             self.assertNotIn("extractor.twitter.cookies-update=false", pixiv_command)
+            eh_original = runner.build_command(
+                marker="eh-original",
+                url="https://e-hentai.org/g/123/aaaaaaaaaa/",
+                output_dir=str(Path(tmp) / "eh-original"),
+                proxy_url=None,
+                http_timeout=10,
+                gallery_retries=1,
+                cookies_file=str(Path(tmp) / "exhentai.cookies.txt"),
+                config_file=None,
+                extra_args=["--range", "1"],
+                site="exhentai",
+                eh_download=EHDownloadOptions(
+                    image_mode="original",
+                    gp_policy="stop",
+                ),
+            )
+            self.assertIn("extractor.exhentai.original=true", eh_original)
+            self.assertIn("extractor.exhentai.gp=stop", eh_original)
+            eh_resample = runner.build_command(
+                marker="eh-resample",
+                url="https://e-hentai.org/g/123/aaaaaaaaaa/",
+                output_dir=str(Path(tmp) / "eh-resample"),
+                proxy_url=None,
+                http_timeout=10,
+                gallery_retries=1,
+                cookies_file=None,
+                config_file=None,
+                extra_args=[],
+                site="exhentai",
+                eh_download=EHDownloadOptions(
+                    image_mode="resample",
+                    gp_policy="resized",
+                ),
+            )
+            self.assertIn("extractor.exhentai.original=false", eh_resample)
+            self.assertNotIn("extractor.exhentai.gp=resized", eh_resample)
             with self.assertRaises(ValueError):
                 runner.validate_args(["--cache-file", "other.sqlite3"])
 

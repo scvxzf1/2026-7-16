@@ -7,6 +7,17 @@ from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator,
 
 
 ProxyMode = Literal["direct", "prefer", "required"]
+EHImageMode = Literal["original", "resample"]
+EHGPPolicy = Literal["stop", "resized"]
+
+
+class EHDownloadOptions(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    image_mode: EHImageMode = "original"
+    gp_policy: EHGPPolicy = "stop"
+
+
 class SitePolicy(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -20,6 +31,7 @@ class SitePolicy(BaseModel):
     http_timeout: float = Field(default=30.0, ge=1.0, le=3600.0)
     gallery_retries: int = Field(default=2, ge=0, le=50)
     task_timeout_seconds: float = Field(default=0.0, ge=0.0, le=604800.0)
+    eh_download: EHDownloadOptions | None = None
     extra_args: list[str] = Field(default_factory=list, max_length=128)
 
     @field_validator("probe_url")
@@ -79,6 +91,7 @@ class TaskCreate(BaseModel):
     credentials_ref: str | None = Field(default=None, max_length=128)
     cookies_file: str | None = Field(default=None, max_length=2048)
     config_file: str | None = Field(default=None, max_length=2048)
+    eh_download: EHDownloadOptions | None = None
     extra_args: list[str] = Field(default_factory=list, max_length=128)
 
     @field_validator("url")
@@ -206,6 +219,7 @@ class CrawlSource(BaseModel):
     credentials_ref: str | None = Field(default=None, max_length=128)
     cookies_file: str | None = Field(default=None, max_length=2048)
     config_file: str | None = Field(default=None, max_length=2048)
+    eh_download: EHDownloadOptions | None = None
     extra_args: list[str] = Field(default_factory=list, max_length=128)
     discovery_extra_args: list[str] = Field(default_factory=list, max_length=128)
     timeout_seconds: float = Field(default=180.0, ge=5.0, le=3600.0)

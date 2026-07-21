@@ -27,6 +27,7 @@
 - 通过 Mihomo 将 VLESS、VMess、Trojan、Shadowsocks、Hysteria、TUIC 等节点桥接为本地 HTTP 出口；
 - 对每个新地址执行站点探活，图片任务全程固定一个代理节点；
 - 托管 X、Pixiv、EH 的项目专属浏览器授权，Danbooru 公共抓取无需登录；
+- 为 EH/EHX 批次显式选择 `fullimg` 原图或 1280 查看图，并控制 GP 响应时停止或降级；
 - 支持任务取消、失败重试、重启恢复、文件清单和幂等提交。
 
 具体进程边界、状态机、搜索证据规则和代理选择算法见
@@ -236,6 +237,20 @@ Pixiv OAuth 和共享 Profile 清理另有专用授权端点，可直接从 Swag
           "url": "https://www.pixiv.net/users/USER_ID/artworks"
         }
       ]
+    },
+    {
+      "site": "eh",
+      "addresses": [
+        {
+          "address_type": "gallery",
+          "label": "Gallery",
+          "url": "https://e-hentai.org/g/GID/TOKEN/"
+        }
+      ],
+      "eh_download": {
+        "image_mode": "original",
+        "gp_policy": "stop"
+      }
     }
   ],
   "concurrency": 20,
@@ -247,6 +262,10 @@ Pixiv OAuth 和共享 Profile 清理另有专用授权端点，可直接从 Swag
 来源和地址顺序串行推进，只有当前地址内部的图片任务并发。每个新地址开始前会进行一次
 站点探活，并把通过节点集合持久化；该地址的规划与下载只从此集合取得租约。`concurrency`
 还受全局调度上限限制，`max_tasks` 限制整个批次的媒体任务规模。
+
+EH/EHX 来源的 `eh_download.image_mode` 接受 `original` 或 `resample`。原图模式下，
+`gp_policy=stop` 保持严格原图并在 GP 响应时停止，`gp_policy=resized` 允许 gallery-dl
+降级为 1280 查看图。WebUI 默认提交 `original + stop`。
 
 ### 代理策略
 

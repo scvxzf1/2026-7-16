@@ -10,7 +10,7 @@ from gdl_backend.database import Database
 from gdl_backend.gallery import GalleryRunResult
 from gdl_backend.proxy import ProxyLease
 from gdl_backend.scheduler import TaskScheduler
-from gdl_backend.schemas import SitePolicy, TaskPolicy
+from gdl_backend.schemas import EHDownloadOptions, SitePolicy, TaskPolicy
 
 from tests.helpers import make_settings
 
@@ -129,6 +129,34 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
         await scheduler.stop()
         self.assertEqual(task["status"], "succeeded")
         self.assertTrue(self.db.get_logs("task-1"))
+
+    async def test_eh_download_policy_reaches_gallery_runner(self):
+        task_values = values(self.root, proxy_mode="direct", attempts=1)
+        task_values.update(
+            {
+                "url": "https://e-hentai.org/s/aaaaaaaaaa/123-1",
+                "site": "exhentai",
+                "policy": SitePolicy(
+                    max_concurrency=1,
+                    proxy_mode="direct",
+                    eh_download=EHDownloadOptions(
+                        image_mode="original",
+                        gp_policy="stop",
+                    ),
+                ).model_dump(),
+            }
+        )
+        self.db.create_task(task_values)
+        gallery = FakeGallery([GalleryRunResult(0, "saved file", False, "m", 101)])
+        scheduler = TaskScheduler(self.db, gallery, FakeProxy(), self.settings.scheduler)
+        await scheduler.start()
+        task = await self.wait_terminal("task-1")
+        await scheduler.stop()
+
+        self.assertEqual(task["status"], "succeeded")
+        self.assertEqual(gallery.calls[0]["site"], "exhentai")
+        self.assertEqual(gallery.calls[0]["eh_download"].image_mode, "original")
+        self.assertEqual(gallery.calls[0]["eh_download"].gp_policy, "stop")
 
     async def test_prefer_uses_proxy_when_a_node_is_available(self):
         self.db.create_task(values(self.root, proxy_mode="prefer", attempts=1))

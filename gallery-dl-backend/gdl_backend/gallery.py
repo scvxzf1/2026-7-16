@@ -15,6 +15,7 @@ from urllib.parse import urlsplit
 from .config import GallerySettings
 from .process_control import terminate_process
 from .redaction import redact_text
+from .schemas import EHDownloadOptions
 
 
 LineCallback = Callable[[str, str], Awaitable[None]]
@@ -95,6 +96,24 @@ class GalleryRunner:
             raise ValueError(f"credentials_ref 未配置对应环境变量: {credentials_ref}")
         return username, password
 
+    @staticmethod
+    def _eh_option_args(
+        site: str | None,
+        options: EHDownloadOptions | None,
+    ) -> list[str]:
+        if site != "exhentai" or options is None:
+            return []
+        original = options.image_mode == "original"
+        args = [
+            "--option",
+            f"extractor.exhentai.original={'true' if original else 'false'}",
+        ]
+        if original:
+            args.extend(
+                ["--option", f"extractor.exhentai.gp={options.gp_policy}"]
+            )
+        return args
+
     def build_command(
         self,
         *,
@@ -107,6 +126,8 @@ class GalleryRunner:
         cookies_file: str | None,
         config_file: str | None,
         extra_args: list[str],
+        site: str | None = None,
+        eh_download: EHDownloadOptions | None = None,
     ) -> list[str]:
         command = [
             self.settings.python_executable or sys.executable,
@@ -135,6 +156,7 @@ class GalleryRunner:
         if proxy_url:
             command.extend(["--proxy", proxy_url])
         command.extend(self.validate_args(extra_args))
+        command.extend(self._eh_option_args(site, eh_download))
         if cookies_file and _is_twitter_web_url(url):
             command.extend(["--option", "extractor.twitter.cookies-update=false"])
         command.append(url)
@@ -156,6 +178,8 @@ class GalleryRunner:
         extra_args: list[str],
         on_line: LineCallback,
         on_started: StartedCallback,
+        site: str | None = None,
+        eh_download: EHDownloadOptions | None = None,
     ) -> GalleryRunResult:
         if not (self.settings.repo_path / "gallery_dl" / "__init__.py").is_file():
             raise FileNotFoundError(f"gallery-dl 源码目录无效: {self.settings.repo_path}")
@@ -170,6 +194,8 @@ class GalleryRunner:
             cookies_file=cookies_file,
             config_file=config_file,
             extra_args=extra_args,
+            site=site,
+            eh_download=eh_download,
         )
         env = os.environ.copy()
         env["PYTHONUNBUFFERED"] = "1"

@@ -258,6 +258,8 @@ class TaskScheduler:
                     extra_args=extra_args,
                     on_line=log,
                     on_started=started,
+                    site=task["site"],
+                    eh_download=policy.eh_download,
                 )
             finally:
                 progress_stop.set()
